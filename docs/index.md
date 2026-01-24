@@ -1,3 +1,7 @@
+# Nerdbot
+
+**Nerdbot** is a customized crypto trading bot powered by the [Freqtrade](https://github.com/freqtrade/freqtrade) engine.
+
 ![freqtrade](assets/freqtrade_poweredby.svg)
 
 [![Freqtrade CI](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml)
@@ -11,7 +15,7 @@
 
 ## Introduction
 
-Freqtrade is a free and open source crypto trading bot written in Python. It is designed to support all major exchanges and be controlled via Telegram or webUI. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
+Nerdbot is a free and open source crypto trading bot written in Python, built on top of the Freqtrade engine. It is designed to support all major exchanges and be controlled via Telegram or webUI. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
 
 !!! Danger "DISCLAIMER"
     This software is for educational purposes only. Do not risk money which you are afraid to lose. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
@@ -76,7 +80,7 @@ Exchanges confirmed working by the community:
 
 ### Hardware requirements
 
-To run this bot we recommend you a linux cloud instance with a minimum of:
+To run Nerdbot we recommend you a linux cloud instance with a minimum of:
 
 - 2GB RAM
 - 1GB disk space

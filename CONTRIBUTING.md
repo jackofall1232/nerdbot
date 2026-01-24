@@ -1,8 +1,8 @@
 # Contributing
 
-## Contribute to freqtrade
+## Contribute to Nerdbot
 
-Feel like our bot is missing a feature? We welcome your pull requests! 
+Feel like Nerdbot is missing a feature? We welcome your pull requests! 
 
 Issues labeled [good first issue](https://github.com/freqtrade/freqtrade/labels/good%20first%20issue) can be good first contributions, and will help get you familiar with the codebase.
 
@@ -18,7 +18,7 @@ If you are unsure, discuss the feature on our [discord server](https://discord.g
 
 ## Getting started
 
-Best start by reading the [documentation](https://www.freqtrade.io/) to get a feel for what is possible with the bot, or head straight to the [Developer-documentation](https://www.freqtrade.io/en/latest/developer/) (WIP) which should help you getting started.
+Best start by reading the [documentation](https://www.freqtrade.io/) to get a feel for what is possible with Nerdbot (powered by Freqtrade), or head straight to the [Developer-documentation](https://www.freqtrade.io/en/latest/developer/) (WIP) which should help you getting started.
 
 ## Before sending the PR
 
