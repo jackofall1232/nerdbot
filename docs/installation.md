@@ -1,8 +1,11 @@
 # Installation
 
-This page explains how to prepare your environment for running the bot.
+This page explains how to prepare your environment for running Nerdbot.
 
-The freqtrade documentation describes various ways to install freqtrade
+!!! Note "Nerdbot is powered by Freqtrade"
+    Nerdbot is built on top of the Freqtrade engine. You can use either `nerdbot` or `freqtrade` commands interchangeably.
+
+The Freqtrade documentation describes various ways to install Nerdbot
 
 * [Docker images](docker_quickstart.md) (separate page)
 * [Script Installation](#script-installation)

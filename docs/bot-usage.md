@@ -1,9 +1,12 @@
 # Start the bot
 
-This page explains the different parameters of the bot and how to run it.
+This page explains the different parameters of Nerdbot and how to run it.
+
+!!! Note "Nerdbot CLI"
+    Nerdbot can be invoked using either `nerdbot` or `freqtrade` - both commands are equivalent and interchangeable.
 
 !!! Note
-    If you've used `setup.sh`, don't forget to activate your virtual environment (`source .venv/bin/activate`) before running freqtrade commands.
+    If you've used `setup.sh`, don't forget to activate your virtual environment (`source .venv/bin/activate`) before running nerdbot/freqtrade commands.
 
 !!! Warning "Up-to-date clock"
     The clock on the system running the bot must be accurate, synchronized to a NTP server frequently enough to avoid problems with communication to the exchanges.

@@ -1,11 +1,13 @@
-# ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
+# Nerdbot
+
+**Nerdbot** is a customized crypto trading bot powered by the [Freqtrade](https://github.com/freqtrade/freqtrade) engine.
 
 [![Freqtrade CI](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml)
 [![DOI](https://joss.theoj.org/papers/10.21105/joss.04864/status.svg)](https://doi.org/10.21105/joss.04864)
 [![Coverage Status](https://coveralls.io/repos/github/freqtrade/freqtrade/badge.svg?branch=develop&service=github)](https://coveralls.io/github/freqtrade/freqtrade?branch=develop)
 [![Documentation](https://readthedocs.org/projects/freqtrade/badge/)](https://www.freqtrade.io)
 
-Freqtrade is a free and open source crypto trading bot written in Python. It is designed to support all major exchanges and be controlled via Telegram or webUI. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
+Nerdbot is a free and open source crypto trading bot written in Python, built on top of the Freqtrade engine. It is designed to support all major exchanges and be controlled via Telegram or webUI. It contains backtesting, plotting and money management tools as well as strategy optimization by machine learning.
 
 ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade-screenshot.png)
 
@@ -59,9 +61,9 @@ Exchanges confirmed working by the community:
 
 ## Documentation
 
-We invite you to read the bot documentation to ensure you understand how the bot is working.
+We invite you to read the bot documentation to ensure you understand how Nerdbot works.
 
-Please find the complete documentation on the [freqtrade website](https://www.freqtrade.io).
+Since Nerdbot is powered by the Freqtrade engine, please find the complete documentation on the [Freqtrade website](https://www.freqtrade.io).
 
 ## Features
 
@@ -80,20 +82,23 @@ Please find the complete documentation on the [freqtrade website](https://www.fr
 
 ## Quick start
 
-Please refer to the [Docker Quickstart documentation](https://www.freqtrade.io/en/stable/docker_quickstart/) on how to get started quickly.
+Nerdbot uses the same installation process as Freqtrade. Please refer to the [Docker Quickstart documentation](https://www.freqtrade.io/en/stable/docker_quickstart/) on how to get started quickly.
 
 For further (native) installation methods, please refer to the [Installation documentation page](https://www.freqtrade.io/en/stable/installation/).
 
 ## Basic Usage
 
+Nerdbot can be invoked using either the `nerdbot` or `freqtrade` command (both are equivalent):
+
 ### Bot commands
 
 ```
-usage: freqtrade [-h] [-V]
+usage: nerdbot [-h] [-V]
+       freqtrade [-h] [-V]
                  {trade,create-userdir,new-config,show-config,new-strategy,download-data,convert-data,convert-trade-data,trades-to-ohlcv,list-data,backtesting,backtesting-show,backtesting-analysis,edge,hyperopt,hyperopt-list,hyperopt-show,list-exchanges,list-markets,list-pairs,list-strategies,list-hyperoptloss,list-freqaimodels,list-timeframes,show-trades,test-pairlist,convert-db,install-ui,plot-dataframe,plot-profit,webserver,strategy-updater,lookahead-analysis,recursive-analysis}
                  ...
 
-Free, open source crypto trading bot
+Nerdbot - Free, open source crypto trading bot (powered by Freqtrade)
 
 positional arguments:
   {trade,create-userdir,new-config,show-config,new-strategy,download-data,convert-data,convert-trade-data,trades-to-ohlcv,list-data,backtesting,backtesting-show,backtesting-analysis,edge,hyperopt,hyperopt-list,hyperopt-show,list-exchanges,list-markets,list-pairs,list-strategies,list-hyperoptloss,list-freqaimodels,list-timeframes,show-trades,test-pairlist,convert-db,install-ui,plot-dataframe,plot-profit,webserver,strategy-updater,lookahead-analysis,recursive-analysis}
@@ -217,7 +222,7 @@ The clock must be accurate, synchronized to a NTP server very frequently to avoi
 
 ### Minimum hardware required
 
-To run this bot we recommend you a cloud instance with a minimum of:
+To run Nerdbot we recommend you a cloud instance with a minimum of:
 
 - Minimal (advised) system requirements: 2GB RAM, 1GB disk space, 2vCPU
 

@@ -139,6 +139,7 @@ Documentation = "https://freqtrade.io"
 
 [project.scripts]
 freqtrade = "freqtrade.main:main"
+nerdbot = "freqtrade.main:main"
 
 [tool.setuptools]
 include-package-data = true

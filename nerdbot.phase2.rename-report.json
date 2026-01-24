@@ -1,0 +1,142 @@
+{
+  "phase": "2",
+  "name": "Controlled Nerdbot Renaming & Branding",
+  "execution_date": "2026-01-24",
+  "status": "completed",
+
+  "modified_files": [
+    {
+      "path": "pyproject.toml",
+      "change_type": "cli_alias_addition",
+      "description": "Added 'nerdbot' as a thin CLI alias pointing to freqtrade.main:main",
+      "safety_justification": "New entry point only - no existing code modified, freqtrade entry point unchanged"
+    },
+    {
+      "path": "README.md",
+      "change_type": "branding_text_update",
+      "description": "Updated project introduction to mention Nerdbot as the branded name, powered by Freqtrade engine",
+      "safety_justification": "Documentation-only changes, no runtime code affected"
+    },
+    {
+      "path": "docs/index.md",
+      "change_type": "branding_text_update",
+      "description": "Added Nerdbot branding header and updated introduction text",
+      "safety_justification": "Documentation-only changes, no runtime code affected"
+    },
+    {
+      "path": "docs/bot-usage.md",
+      "change_type": "branding_text_update",
+      "description": "Added note about nerdbot CLI alias and updated intro text",
+      "safety_justification": "Documentation-only changes, no runtime code affected"
+    },
+    {
+      "path": "docs/installation.md",
+      "change_type": "branding_text_update",
+      "description": "Added Nerdbot branding note and updated intro text",
+      "safety_justification": "Documentation-only changes, no runtime code affected"
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "change_type": "branding_text_update",
+      "description": "Updated header and references to mention Nerdbot",
+      "safety_justification": "Documentation-only changes, no runtime code affected"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.md",
+      "change_type": "branding_text_update",
+      "description": "Updated references from Freqtrade to Nerdbot in bug report template",
+      "safety_justification": "GitHub template only, no runtime code affected"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.md",
+      "change_type": "branding_text_update",
+      "description": "Updated version check command to show nerdbot alias",
+      "safety_justification": "GitHub template only, no runtime code affected"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/question.md",
+      "change_type": "branding_text_update",
+      "description": "Updated version check command to show nerdbot alias",
+      "safety_justification": "GitHub template only, no runtime code affected"
+    }
+  ],
+
+  "renamed_identifiers": [],
+
+  "cli_entrypoints": {
+    "existing": {
+      "name": "freqtrade",
+      "entry_point": "freqtrade.main:main",
+      "status": "UNCHANGED"
+    },
+    "new": {
+      "name": "nerdbot",
+      "entry_point": "freqtrade.main:main",
+      "status": "ADDED",
+      "relationship": "Thin alias of freqtrade - invokes identical runtime"
+    }
+  },
+
+  "explicitly_unchanged_critical_paths": {
+    "internal_packages": {
+      "status": "UNCHANGED",
+      "paths": ["freqtrade/*"],
+      "reason": "No internal package names, imports, or module paths were modified"
+    },
+    "import_paths": {
+      "status": "UNCHANGED",
+      "reason": "All Python imports remain as freqtrade.* - no changes made"
+    },
+    "function_class_names": {
+      "status": "UNCHANGED",
+      "reason": "No function or class names were renamed"
+    },
+    "trading_logic": {
+      "status": "UNCHANGED",
+      "paths": ["freqtrade/strategy/*", "freqtrade/optimize/*", "freqtrade/rpc/*"],
+      "reason": "Trading, strategy, and execution logic completely untouched"
+    },
+    "exchange_adapters": {
+      "status": "UNCHANGED",
+      "paths": ["freqtrade/exchange/*"],
+      "reason": "Exchange adapter code completely untouched"
+    },
+    "persistence_database": {
+      "status": "UNCHANGED",
+      "paths": ["freqtrade/persistence/*"],
+      "reason": "Database and persistence code completely untouched"
+    },
+    "config_structure": {
+      "status": "UNCHANGED",
+      "reason": "No config keys or config file structure was modified"
+    },
+    "cli_argument_parsing": {
+      "status": "UNCHANGED",
+      "paths": ["freqtrade/commands/*"],
+      "reason": "CLI argument parsing code completely untouched - only added alias entry point"
+    },
+    "tests": {
+      "status": "UNCHANGED",
+      "paths": ["tests/*"],
+      "reason": "Test files were not modified"
+    }
+  },
+
+  "validation_checklist": {
+    "freqtrade_cli_functional": "Entry point unchanged - freqtrade command invokes freqtrade.main:main",
+    "nerdbot_cli_functional": "New alias added - nerdbot command invokes same freqtrade.main:main",
+    "no_imports_changed": true,
+    "no_config_keys_changed": true,
+    "no_runtime_paths_diverged": true,
+    "no_code_refactoring": true,
+    "no_logic_changes": true
+  },
+
+  "notes": [
+    "All changes strictly limited to documentation and CLI alias",
+    "Freqtrade remains the internal package/module name",
+    "Nerdbot is presented as the user-facing brand name",
+    "Both CLI commands (nerdbot and freqtrade) invoke identical runtime",
+    "No breaking changes introduced"
+  ]
+}
