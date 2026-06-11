@@ -3,11 +3,11 @@ nerdbot_vault - CCXT/Freqtrade exchange adapter backed by the nerdbot-vault
 credential proxy.
 
 Freqtrade believes it is talking to an exchange; in reality every
-CREDENTIALED operation (place order, cancel order, fetch balances, validate
-credentials) is executed by the nerdbot-vault proxy. Exchange API
-credentials NEVER reach this container. Market data (tickers, OHLCV, order
-books, markets) is fetched directly from the real exchange's PUBLIC
-endpoints via a zero-credential ccxt instance.
+CREDENTIALED operation (place order, cancel order, query order state, list
+open orders, fetch balances, validate credentials) is executed by the
+nerdbot-vault proxy. Exchange API credentials NEVER reach this container.
+Market data (tickers, OHLCV, order books, markets) is fetched directly from
+the real exchange's PUBLIC endpoints via a zero-credential ccxt instance.
 
 This module provides two layers:
 
@@ -62,18 +62,16 @@ SECURITY INVARIANTS
 - A FRESH lease is acquired before EVERY vault proxy call; leases are never
   cached or reused (vault TTL is ~30s; we treat each as single-use).
 - Lease acquisition failure raises ``ccxt.AuthenticationError``.
-- Paper mode never calls the vault for order placement/cancellation (orders
-  are simulated locally; the vault rejects paper keys for live orders), but
-  it still uses the vault for balance reads and startup credential
-  validation. Vault configuration is therefore required in paper mode too
-  (the backend always supplies the vault env vars).
+- Paper mode never calls the vault for order placement/cancellation/state
+  (orders are simulated and tracked locally; the vault rejects paper keys
+  for live orders), but it still uses the vault for balance reads and
+  startup credential validation. Vault configuration is therefore required
+  in paper mode too (the backend always supplies the vault env vars).
+- Live ``fetch_order`` / ``fetch_open_orders`` are delegated to the vault's
+  read-only order-query endpoints (orders/query, orders/open) - never to
+  public ccxt endpoints, which exchanges reject for private data.
 - The market-data path holds zero credentials.
 - The backend token is never logged.
-
-KNOWN LIMITATION: the vault proxy API exposes no order-query endpoint, so
-live ``fetch_order`` / ``fetch_open_orders`` can only use public ccxt
-endpoints (which exchanges reject for private data). Live order state must
-be derived from the vault's place/cancel responses.
 """
 
 import logging
@@ -102,12 +100,57 @@ _TRUTHY = {"1", "true", "yes", "on"}
 #: Default paper wallet when IS_PAPER_TRADING is enabled.
 DEFAULT_PAPER_WALLET = {"USDT": 1000.0, "USD": 1000.0}
 
-# Map vault order status -> ccxt order status
+# Map vault order status -> ccxt order status (place-order responses)
 _VAULT_ORDER_STATUS_TO_CCXT = {
     "open": "open",
     "filled": "closed",
     "rejected": "rejected",
 }
+
+# Map vault OrderEntry status -> ccxt order status (order-query responses).
+# Note: CCXT uses the American spelling "canceled".
+_VAULT_ENTRY_STATUS_TO_CCXT = {
+    "open": "open",
+    "closed": "closed",
+    "cancelled": "canceled",
+}
+
+
+def _float_or_none(value) -> float | None:
+    """Coerce vault decimal strings to float, passing None through."""
+    return float(value) if value is not None else None
+
+
+def _order_entry_to_ccxt(entry: dict, requested_symbol: str | None = None) -> dict:
+    """
+    Convert a vault OrderEntry dict to the standard CCXT order structure.
+
+    The requested ccxt symbol (e.g. "SOL/USD") is preferred over the
+    exchange-normalised symbol the vault echoes back (Kraken returns e.g.
+    "SOLUSD"), so Freqtrade's pair bookkeeping keeps working.
+    """
+    order_id = entry.get("order_id")
+    if not order_id:
+        raise ccxt.ExchangeError("vault order entry missing order_id")
+    status = entry.get("status")
+    return {
+        "id": str(order_id),
+        "clientOrderId": None,
+        "timestamp": None,
+        "datetime": None,
+        "symbol": requested_symbol or entry.get("symbol"),
+        "type": entry.get("type"),
+        "side": entry.get("side"),
+        "price": _float_or_none(entry.get("price")),
+        "average": _float_or_none(entry.get("avg_price")),
+        "amount": _float_or_none(entry.get("amount")),
+        "filled": float(entry.get("filled_amount") or 0.0),
+        "remaining": _float_or_none(entry.get("remaining")),
+        "status": _VAULT_ENTRY_STATUS_TO_CCXT.get(status, status),
+        "fee": None,
+        "trades": [],
+        "info": entry,
+    }
 
 
 def _env_flag(name: str) -> bool:
@@ -355,7 +398,7 @@ class NerdbotVaultAdapter:
         self.vault_client.close()
 
     # ------------------------------------------------------------------
-    # Market data / order info -> read-only ccxt (zero credentials)
+    # Market data -> read-only ccxt (zero credentials)
     # ------------------------------------------------------------------
 
     def fetch_ticker(self, symbol: str, params: dict | None = None) -> dict:
@@ -371,23 +414,52 @@ class NerdbotVaultAdapter:
     ) -> list:
         return self.market_client.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
 
+    # ------------------------------------------------------------------
+    # Order state (read-only) -> vault proxy (or paper simulator)
+    # ------------------------------------------------------------------
+
     def fetch_order(self, id: str, symbol: str | None = None, params: dict | None = None) -> dict:  # noqa: A002
+        """
+        Fetch the current state of an order.
+
+        Live mode: delegated to the vault's read-only orders/query proxy
+        endpoint (fresh lease per call). Paper mode: served from the local
+        simulator - the vault is never called.
+        """
         if self.is_paper_trading:
             return self.paper_simulator.get_order(id)
-        # KNOWN LIMITATION (pending a vault order-query endpoint): the vault
-        # proxy currently exposes no order-query API, so live order lookup
-        # falls back to the read-only ccxt instance. This works only for
-        # exchanges/endpoints that expose order lookup publicly; delegating
-        # to the vault here is intentionally deferred until that endpoint
-        # exists.
-        return self.market_client.ccxt_exchange.fetch_order(id, symbol, params or {})
+
+        lease_id = self._fresh_lease()
+        entry = self.vault_client.query_order(
+            vault_key_id=self.vault_key_id,
+            bot_id=self.bot_id,
+            lease_id=lease_id,
+            order_id=id,
+            exchange=self.real_exchange,
+            symbol=symbol,
+        )
+        return _order_entry_to_ccxt(entry, requested_symbol=symbol)
 
     def fetch_open_orders(self, symbol: str | None = None, params: dict | None = None) -> list:
+        """
+        List currently open orders.
+
+        Live mode: delegated to the vault's read-only orders/open proxy
+        endpoint (fresh lease per call). Paper mode: served from the local
+        simulator - the vault is never called.
+        """
         if self.is_paper_trading:
             return self.paper_simulator.get_open_orders(symbol)
-        # KNOWN LIMITATION: same as fetch_order above - no vault order-query
-        # endpoint yet, so this uses the public (credential-free) ccxt path.
-        return self.market_client.ccxt_exchange.fetch_open_orders(symbol, params=params or {})
+
+        lease_id = self._fresh_lease()
+        entries = self.vault_client.get_open_orders(
+            vault_key_id=self.vault_key_id,
+            bot_id=self.bot_id,
+            lease_id=lease_id,
+            exchange=self.real_exchange,
+            symbol=symbol,
+        )
+        return [_order_entry_to_ccxt(entry, requested_symbol=symbol) for entry in entries]
 
 
 # =============================================================================
@@ -400,9 +472,11 @@ try:
         InsufficientFundsError,
         InvalidOrderException,
         OperationalException,
+        RetryableOrderError,
         TemporaryError,
     )
     from freqtrade.exchange import Exchange as _FreqtradeExchange
+    from freqtrade.exchange.common import API_FETCH_ORDER_RETRY_COUNT, retrier
 
     FREQTRADE_AVAILABLE = True
 except ImportError:  # freqtrade (or its dependencies) not installed
@@ -466,13 +540,14 @@ if FREQTRADE_AVAILABLE:
 
         Market data flows through the inherited Exchange machinery using the
         credential-free ccxt shim (real exchange public API). Credentialed
-        operations are overridden to go through the vault proxy via
-        ``NerdbotVaultAdapter``. With ``dry_run: true`` (paper configs),
-        the vault is never called for order placement/cancellation -
-        Freqtrade's own local simulation handles orders - but
-        ``get_balances`` still reads real balances through the vault, and
-        startup credential validation always runs. Vault configuration is
-        therefore required in paper mode too.
+        operations (create_order, cancel_order, fetch_order,
+        fetch_open_orders, get_balances) are overridden to go through the
+        vault proxy via ``NerdbotVaultAdapter``. With ``dry_run: true``
+        (paper configs), the vault is never called for order
+        placement/cancellation/state - Freqtrade's own local simulation
+        handles and tracks orders - but ``get_balances`` still reads real
+        balances through the vault, and startup credential validation always
+        runs. Vault configuration is therefore required in paper mode too.
         """
 
         _ft_has: dict = {
@@ -590,6 +665,57 @@ if FREQTRADE_AVAILABLE:
             except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
                 raise TemporaryError(
                     f"Could not cancel order due to {e.__class__.__name__}. Message: {e}"
+                ) from e
+            except ccxt.BaseError as e:
+                raise OperationalException(e) from e
+
+        @retrier(retries=API_FETCH_ORDER_RETRY_COUNT)
+        def fetch_order(self, order_id: str, pair: str, params: dict | None = None):
+            if self._config["dry_run"]:
+                # Paper trading: Freqtrade's local dry-run order bookkeeping;
+                # vault NOT called.
+                return super().fetch_order(order_id, pair, params)
+            try:
+                order = self._vault_adapter.fetch_order(order_id, pair)
+                self._log_exchange_response("fetch_order", order)
+                return self._order_contracts_to_amount(order)
+            except ccxt.OrderNotFound as e:
+                raise RetryableOrderError(
+                    f"Order not found (pair: {pair} id: {order_id}). Message: {e}"
+                ) from e
+            except ccxt.InvalidOrder as e:
+                raise InvalidOrderException(
+                    f"Tried to get an invalid order (pair: {pair} id: {order_id}). Message: {e}"
+                ) from e
+            except ccxt.DDoSProtection as e:
+                raise DDosProtection(e) from e
+            except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+                raise TemporaryError(
+                    f"Could not get order due to {e.__class__.__name__}. Message: {e}"
+                ) from e
+            except ccxt.BaseError as e:
+                raise OperationalException(e) from e
+
+        def fetch_open_orders(self, pair: str | None = None, params: dict | None = None) -> list:
+            if self._config["dry_run"]:
+                # Paper trading: Freqtrade's local dry-run order bookkeeping;
+                # vault NOT called. (The base Exchange class has no public
+                # fetch_open_orders, so there is no super() to defer to.)
+                return [
+                    order
+                    for order in self._dry_run_open_orders.values()
+                    if order.get("status") == "open"
+                    and (pair is None or order.get("symbol") == pair)
+                ]
+            try:
+                orders = self._vault_adapter.fetch_open_orders(pair)
+                self._log_exchange_response("fetch_open_orders", orders)
+                return [self._order_contracts_to_amount(order) for order in orders]
+            except ccxt.DDoSProtection as e:
+                raise DDosProtection(e) from e
+            except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+                raise TemporaryError(
+                    f"Could not get open orders due to {e.__class__.__name__}. Message: {e}"
                 ) from e
             except ccxt.BaseError as e:
                 raise OperationalException(e) from e

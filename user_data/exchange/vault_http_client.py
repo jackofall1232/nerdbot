@@ -8,7 +8,8 @@ require:
 - ``Authorization: Bearer <BACKEND_TOKEN>``      (backend service auth)
 - ``X-Backend-Instance-ID: <instance id>``       (instance binding)
 
-Proxy operations (validate / orders / orders/cancel / balances) additionally
+Proxy operations (validate / orders / orders/cancel / orders/query /
+orders/open / balances) additionally
 require a short-lived lease (~30s TTL), created via the lease endpoint and
 passed in the ``X-Vault-Lease`` header. Leases are bound to
 (vault_key_id, bot_id, backend_instance_id) by the vault.
@@ -34,6 +35,16 @@ app/schemas/proxy_api.py):
 - POST /v1/proxy/{vault_key_id}/balances
     body: {"bot_id", "exchange"}
     resp: {"balances": [{"asset", "available", "locked"}, ...]}
+- POST /v1/proxy/{vault_key_id}/orders/query   (read-only)
+    body: {"bot_id", "exchange", "order_id", "symbol"?}
+    resp: {"order": OrderEntry}
+- POST /v1/proxy/{vault_key_id}/orders/open    (read-only)
+    body: {"bot_id", "exchange", "symbol"?}
+    resp: {"orders": [OrderEntry, ...]}
+
+where OrderEntry is {"order_id", "status": "open"|"closed"|"cancelled",
+"symbol"?, "side"?, "type"?, "amount"?, "filled_amount", "remaining"?,
+"price"?, "avg_price"?}.
 
 SECURITY: the backend token is never logged, never included in __repr__,
 and never present in raised exception messages.
@@ -234,6 +245,60 @@ class VaultHTTPClient:
         """
         body = {"bot_id": str(bot_id), "exchange": exchange, "order_id": str(order_id)}
         return self._post(f"/v1/proxy/{vault_key_id}/orders/cancel", body, lease_id=lease_id)
+
+    def query_order(
+        self,
+        vault_key_id: str,
+        bot_id: str,
+        lease_id: str,
+        order_id: str,
+        exchange: str,
+        symbol: str | None = None,
+    ) -> dict:
+        """
+        Query an order's current state (read-only).
+        POST /v1/proxy/{vault_key_id}/orders/query
+
+        :param symbol: Exchange symbol; required by some exchanges (Binance).
+        :return: OrderEntry dict: {"order_id", "status", "symbol"?, "side"?,
+                 "type"?, "amount"?, "filled_amount", "remaining"?, "price"?,
+                 "avg_price"?}
+        """
+        body: dict = {
+            "bot_id": str(bot_id),
+            "exchange": exchange,
+            "order_id": str(order_id),
+        }
+        if symbol is not None:
+            body["symbol"] = symbol
+        data = self._post(f"/v1/proxy/{vault_key_id}/orders/query", body, lease_id=lease_id)
+        order = data.get("order")
+        if not isinstance(order, dict):
+            raise ccxt.ExchangeError("Vault order-query response missing order")
+        return order
+
+    def get_open_orders(
+        self,
+        vault_key_id: str,
+        bot_id: str,
+        lease_id: str,
+        exchange: str,
+        symbol: str | None = None,
+    ) -> list[dict]:
+        """
+        List currently open orders (read-only).
+        POST /v1/proxy/{vault_key_id}/orders/open
+
+        :return: list of OrderEntry dicts (see :meth:`query_order`).
+        """
+        body: dict = {"bot_id": str(bot_id), "exchange": exchange}
+        if symbol is not None:
+            body["symbol"] = symbol
+        data = self._post(f"/v1/proxy/{vault_key_id}/orders/open", body, lease_id=lease_id)
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            raise ccxt.ExchangeError("Vault open-orders response missing orders")
+        return orders
 
     def get_balances(self, vault_key_id: str, lease_id: str, bot_id: str, exchange: str) -> dict:
         """

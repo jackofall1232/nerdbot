@@ -66,6 +66,12 @@ def make_vault_client_mock():
     }
     client.cancel_order.return_value = {"status": "cancelled"}
     client.get_balances.return_value = {"balances": []}
+    client.query_order.return_value = {
+        "order_id": "EX-1",
+        "status": "open",
+        "filled_amount": "0",
+    }
+    client.get_open_orders.return_value = []
     return client
 
 
@@ -291,6 +297,181 @@ class TestBalances:
 
 
 # =============================================================================
+# Order state (fetch_order / fetch_open_orders): vault delegation + conversion
+# =============================================================================
+
+
+def make_order_entry(**overrides) -> dict:
+    """A representative vault OrderEntry (wire format: decimals as strings)."""
+    entry = {
+        "order_id": "EX-7",
+        "status": "open",
+        "symbol": "SOLUSD",  # exchange-normalised (Kraken style)
+        "side": "buy",
+        "type": "limit",
+        "amount": "2.0",
+        "filled_amount": "0.5",
+        "remaining": "1.5",
+        "price": "100.0",
+        "avg_price": "99.5",
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestOrderStateRouting:
+    def test_fetch_order_routes_through_vault_with_fresh_lease(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.return_value = make_order_entry()
+        adapter = make_adapter(vault_client=client)
+
+        order = adapter.fetch_order("EX-7", "SOL/USD")
+
+        client.query_order.assert_called_once_with(
+            vault_key_id=VAULT_KEY_ID,
+            bot_id=BOT_ID,
+            lease_id="lease-2",  # fresh lease, not the init lease
+            order_id="EX-7",
+            exchange="binance",
+            symbol="SOL/USD",
+        )
+        assert order["id"] == "EX-7"
+        assert order["status"] == "open"
+        assert order["side"] == "buy"
+        assert order["type"] == "limit"
+
+    def test_fetch_order_converts_entry_to_ccxt_structure(self, vault_env):
+        client = make_vault_client_mock()
+        entry = make_order_entry()
+        client.query_order.return_value = entry
+        adapter = make_adapter(vault_client=client)
+
+        order = adapter.fetch_order("EX-7", "SOL/USD")
+
+        # Requested ccxt symbol wins over the exchange-normalised "SOLUSD".
+        assert order["symbol"] == "SOL/USD"
+        # Numeric coercion: wire decimals (strings) -> floats.
+        assert order["price"] == 100.0
+        assert order["average"] == 99.5
+        assert order["amount"] == 2.0
+        assert order["filled"] == 0.5
+        assert order["remaining"] == 1.5
+        assert order["clientOrderId"] is None
+        assert order["timestamp"] is None
+        assert order["datetime"] is None
+        assert order["fee"] is None
+        assert order["trades"] == []
+        assert order["info"] is entry
+
+    def test_fetch_order_falls_back_to_vault_symbol_when_not_requested(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.return_value = make_order_entry()
+        adapter = make_adapter(vault_client=client)
+        order = adapter.fetch_order("EX-7")
+        assert order["symbol"] == "SOLUSD"
+        assert client.query_order.call_args.kwargs["symbol"] is None
+
+    @pytest.mark.parametrize(
+        ("vault_status", "ccxt_status"),
+        [("open", "open"), ("closed", "closed"), ("cancelled", "canceled")],
+    )
+    def test_fetch_order_status_mapping(self, vault_env, vault_status, ccxt_status):
+        client = make_vault_client_mock()
+        client.query_order.return_value = make_order_entry(status=vault_status)
+        adapter = make_adapter(vault_client=client)
+        assert adapter.fetch_order("EX-7", "SOL/USD")["status"] == ccxt_status
+
+    def test_fetch_order_handles_minimal_entry(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.return_value = {
+            "order_id": "EX-8",
+            "status": "open",
+            "filled_amount": "0",
+        }
+        adapter = make_adapter(vault_client=client)
+        order = adapter.fetch_order("EX-8", "SOL/USD")
+        assert order["filled"] == 0.0
+        assert order["price"] is None
+        assert order["average"] is None
+        assert order["amount"] is None
+        assert order["remaining"] is None
+        assert order["side"] is None
+        assert order["type"] is None
+
+    def test_fetch_order_missing_order_id_raises_exchange_error(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.return_value = {"status": "open", "filled_amount": "0"}
+        adapter = make_adapter(vault_client=client)
+        with pytest.raises(ccxt.ExchangeError, match="missing order_id"):
+            adapter.fetch_order("EX-9", "SOL/USD")
+
+    def test_fetch_open_orders_routes_through_vault_with_fresh_lease(self, vault_env):
+        client = make_vault_client_mock()
+        client.get_open_orders.return_value = [
+            make_order_entry(),
+            make_order_entry(order_id="EX-8", status="cancelled"),
+        ]
+        adapter = make_adapter(vault_client=client)
+
+        orders = adapter.fetch_open_orders("SOL/USD")
+
+        client.get_open_orders.assert_called_once_with(
+            vault_key_id=VAULT_KEY_ID,
+            bot_id=BOT_ID,
+            lease_id="lease-2",
+            exchange="binance",
+            symbol="SOL/USD",
+        )
+        assert [o["id"] for o in orders] == ["EX-7", "EX-8"]
+        # Requested symbol preference applies to every converted order.
+        assert all(o["symbol"] == "SOL/USD" for o in orders)
+        assert orders[1]["status"] == "canceled"
+
+    def test_fetch_open_orders_without_symbol(self, vault_env):
+        client = make_vault_client_mock()
+        client.get_open_orders.return_value = [make_order_entry()]
+        adapter = make_adapter(vault_client=client)
+        orders = adapter.fetch_open_orders()
+        assert client.get_open_orders.call_args.kwargs["symbol"] is None
+        assert orders[0]["symbol"] == "SOLUSD"
+
+    def test_fresh_lease_per_order_state_call(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.return_value = make_order_entry()
+        adapter = make_adapter(vault_client=client)  # lease-1 (validation)
+
+        adapter.fetch_order("EX-7", "SOL/USD")  # lease-2
+        adapter.fetch_open_orders("SOL/USD")  # lease-3
+        adapter.fetch_order("EX-7", "SOL/USD")  # lease-4
+
+        assert client.acquire_lease.call_count == 4
+        leases = [call.kwargs["lease_id"] for call in client.query_order.call_args_list]
+        assert leases == ["lease-2", "lease-4"]
+        assert client.get_open_orders.call_args.kwargs["lease_id"] == "lease-3"
+
+    def test_lease_failure_blocks_order_queries(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        client.acquire_lease.side_effect = ccxt.AuthenticationError("lease denied")
+        with pytest.raises(ccxt.AuthenticationError):
+            adapter.fetch_order("EX-7", "SOL/USD")
+        with pytest.raises(ccxt.AuthenticationError):
+            adapter.fetch_open_orders("SOL/USD")
+        client.query_order.assert_not_called()
+        client.get_open_orders.assert_not_called()
+
+    def test_vault_auth_failure_propagates(self, vault_env):
+        client = make_vault_client_mock()
+        client.query_order.side_effect = ccxt.AuthenticationError("rejected")
+        client.get_open_orders.side_effect = ccxt.AuthenticationError("rejected")
+        adapter = make_adapter(vault_client=client)
+        with pytest.raises(ccxt.AuthenticationError):
+            adapter.fetch_order("EX-7", "SOL/USD")
+        with pytest.raises(ccxt.AuthenticationError):
+            adapter.fetch_open_orders("SOL/USD")
+
+
+# =============================================================================
 # Paper trading mode: vault NEVER called for orders
 # =============================================================================
 
@@ -328,10 +509,32 @@ class TestPaperTradingMode:
         assert balance["USDT"]["free"] == 1000.0
 
     def test_paper_open_orders_come_from_simulator(self, paper_adapter):
-        adapter, _client = paper_adapter
+        adapter, client = paper_adapter
         order = adapter.create_order("SOL/USDT", "limit", "buy", 1.0, 50.0)
         open_orders = adapter.fetch_open_orders("SOL/USDT")
         assert [o["id"] for o in open_orders] == [order["id"]]
+        client.get_open_orders.assert_not_called()
+
+    def test_paper_order_state_never_calls_vault(self, paper_adapter):
+        adapter, client = paper_adapter
+        order = adapter.create_order("SOL/USDT", "limit", "buy", 1.0, 50.0)  # resting
+        baseline_leases = client.acquire_lease.call_count  # init validation only
+
+        fetched = adapter.fetch_order(order["id"])
+        open_orders = adapter.fetch_open_orders("SOL/USDT")
+
+        assert fetched["id"] == order["id"]
+        assert fetched["status"] == "open"
+        assert [o["id"] for o in open_orders] == [order["id"]]
+        client.query_order.assert_not_called()
+        client.get_open_orders.assert_not_called()
+        assert client.acquire_lease.call_count == baseline_leases
+
+    def test_paper_fetch_order_unknown_id_raises_order_not_found(self, paper_adapter):
+        adapter, client = paper_adapter
+        with pytest.raises(ccxt.OrderNotFound):
+            adapter.fetch_order("does-not-exist")
+        client.query_order.assert_not_called()
 
 
 # =============================================================================
@@ -474,11 +677,131 @@ class TestVaultHTTPClientContract:
         assert seen["url"] == f"https://vault.test/v1/proxy/{VAULT_KEY_ID}/balances"
         assert seen["body"] == {"bot_id": BOT_ID, "exchange": "binance"}
 
+    def test_query_order_contract(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["headers"] = request.headers
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "order": {
+                        "order_id": "EX-7",
+                        "status": "closed",
+                        "symbol": "SOLUSD",
+                        "side": "buy",
+                        "type": "limit",
+                        "amount": "2.0",
+                        "filled_amount": "2.0",
+                        "remaining": "0",
+                        "price": "100.0",
+                        "avg_price": "99.5",
+                    }
+                },
+            )
+
+        client = make_http_client(handler)
+        order = client.query_order(
+            VAULT_KEY_ID, BOT_ID, "lease-xyz", "EX-7", "kraken", symbol="SOLUSD"
+        )
+
+        # Returns the unwrapped OrderEntry.
+        assert order["order_id"] == "EX-7"
+        assert order["status"] == "closed"
+        assert seen["url"] == f"https://vault.test/v1/proxy/{VAULT_KEY_ID}/orders/query"
+        assert seen["headers"]["Authorization"] == f"Bearer {TOKEN}"
+        assert seen["headers"]["X-Backend-Instance-ID"] == INSTANCE_ID
+        assert seen["headers"]["X-Vault-Lease"] == "lease-xyz"
+        assert seen["body"] == {
+            "bot_id": BOT_ID,
+            "exchange": "kraken",
+            "order_id": "EX-7",
+            "symbol": "SOLUSD",
+        }
+
+    def test_query_order_omits_symbol_when_not_provided(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, json={"order": {"order_id": "EX-7", "status": "open", "filled_amount": "0"}}
+            )
+
+        client = make_http_client(handler)
+        client.query_order(VAULT_KEY_ID, BOT_ID, "lease-1", "EX-7", "binance")
+        assert seen["body"] == {"bot_id": BOT_ID, "exchange": "binance", "order_id": "EX-7"}
+
+    def test_query_order_missing_order_raises_exchange_error(self):
+        client = make_http_client(lambda request: httpx.Response(200, json={}))
+        with pytest.raises(ccxt.ExchangeError, match="missing order"):
+            client.query_order(VAULT_KEY_ID, BOT_ID, "lease-1", "EX-7", "binance")
+
+    def test_get_open_orders_contract(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["headers"] = request.headers
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "orders": [
+                        {"order_id": "EX-7", "status": "open", "filled_amount": "0"},
+                        {"order_id": "EX-8", "status": "open", "filled_amount": "1.5"},
+                    ]
+                },
+            )
+
+        client = make_http_client(handler)
+        orders = client.get_open_orders(
+            VAULT_KEY_ID, BOT_ID, "lease-abc", "kraken", symbol="SOLUSD"
+        )
+
+        # Returns the unwrapped list of OrderEntry dicts.
+        assert [o["order_id"] for o in orders] == ["EX-7", "EX-8"]
+        assert seen["url"] == f"https://vault.test/v1/proxy/{VAULT_KEY_ID}/orders/open"
+        assert seen["headers"]["Authorization"] == f"Bearer {TOKEN}"
+        assert seen["headers"]["X-Backend-Instance-ID"] == INSTANCE_ID
+        assert seen["headers"]["X-Vault-Lease"] == "lease-abc"
+        assert seen["body"] == {"bot_id": BOT_ID, "exchange": "kraken", "symbol": "SOLUSD"}
+
+    def test_get_open_orders_omits_symbol_when_not_provided(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"orders": []})
+
+        client = make_http_client(handler)
+        assert client.get_open_orders(VAULT_KEY_ID, BOT_ID, "lease-1", "binance") == []
+        assert seen["body"] == {"bot_id": BOT_ID, "exchange": "binance"}
+
+    def test_get_open_orders_missing_orders_raises_exchange_error(self):
+        client = make_http_client(lambda request: httpx.Response(200, json={}))
+        with pytest.raises(ccxt.ExchangeError, match="missing orders"):
+            client.get_open_orders(VAULT_KEY_ID, BOT_ID, "lease-1", "binance")
+
     @pytest.mark.parametrize("status_code", [401, 403])
     def test_auth_rejection_raises_authentication_error(self, status_code):
         client = make_http_client(lambda request: httpx.Response(status_code, json={}))
         with pytest.raises(ccxt.AuthenticationError):
             client.get_balances(VAULT_KEY_ID, "lease-1", BOT_ID, "binance")
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    def test_query_order_auth_rejection_raises_authentication_error(self, status_code):
+        client = make_http_client(lambda request: httpx.Response(status_code, json={}))
+        with pytest.raises(ccxt.AuthenticationError):
+            client.query_order(VAULT_KEY_ID, BOT_ID, "lease-1", "EX-7", "binance")
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    def test_get_open_orders_auth_rejection_raises_authentication_error(self, status_code):
+        client = make_http_client(lambda request: httpx.Response(status_code, json={}))
+        with pytest.raises(ccxt.AuthenticationError):
+            client.get_open_orders(VAULT_KEY_ID, BOT_ID, "lease-1", "binance")
 
     def test_rate_limit_raises_rate_limit_exceeded(self):
         client = make_http_client(lambda request: httpx.Response(429, json={}))
@@ -577,6 +900,111 @@ class TestCloseChain:
         with patch.object(Exchange, "close") as super_close:
             exchange.close()  # must not raise
         super_close.assert_called_once_with()
+
+
+# =============================================================================
+# Freqtrade-level order-state routing (Nerdbot_Vault overrides)
+# =============================================================================
+
+
+@pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+class TestFreqtradeOrderStateRouting:
+    @staticmethod
+    def make_exchange(dry_run: bool):
+        from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        exchange = object.__new__(Nerdbot_Vault)
+        exchange._config = {"dry_run": dry_run}
+        exchange.log_responses = False
+        exchange._vault_adapter = MagicMock()
+        # Spot pairs: contract size 1 leaves orders untouched.
+        exchange.get_contract_size = lambda pair: 1.0
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        exchange._exchange_ws = None
+        exchange._ws_async = None
+        exchange.loop = None
+        return exchange
+
+    def test_live_fetch_order_routes_via_adapter(self, vault_env):
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_order.return_value = {
+            "id": "EX-7",
+            "symbol": "SOL/USD",
+            "status": "open",
+        }
+        order = exchange.fetch_order("EX-7", "SOL/USD")
+        exchange._vault_adapter.fetch_order.assert_called_once_with("EX-7", "SOL/USD")
+        assert order["id"] == "EX-7"
+
+    def test_dry_run_fetch_order_uses_local_simulation(self, vault_env):
+        from unittest.mock import patch
+
+        from freqtrade.exchange import Exchange
+
+        exchange = self.make_exchange(dry_run=True)
+        with patch.object(Exchange, "fetch_order", return_value={"id": "dry-1"}) as super_fetch:
+            order = exchange.fetch_order("dry-1", "SOL/USD")
+        super_fetch.assert_called_once_with("dry-1", "SOL/USD", None)
+        exchange._vault_adapter.fetch_order.assert_not_called()
+        assert order["id"] == "dry-1"
+
+    def test_live_fetch_open_orders_routes_via_adapter(self, vault_env):
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_open_orders.return_value = [
+            {"id": "EX-7", "symbol": "SOL/USD", "status": "open"}
+        ]
+        orders = exchange.fetch_open_orders("SOL/USD")
+        exchange._vault_adapter.fetch_open_orders.assert_called_once_with("SOL/USD")
+        assert [o["id"] for o in orders] == ["EX-7"]
+
+    def test_dry_run_fetch_open_orders_serves_local_orders(self, vault_env):
+        exchange = self.make_exchange(dry_run=True)
+        exchange._dry_run_open_orders = {
+            "1": {"id": "1", "status": "open", "symbol": "SOL/USD"},
+            "2": {"id": "2", "status": "closed", "symbol": "SOL/USD"},
+            "3": {"id": "3", "status": "open", "symbol": "BTC/USD"},
+        }
+        orders = exchange.fetch_open_orders("SOL/USD")
+        assert [o["id"] for o in orders] == ["1"]
+        # Without a pair filter, all open orders are returned.
+        all_orders = exchange.fetch_open_orders()
+        assert sorted(o["id"] for o in all_orders) == ["1", "3"]
+        exchange._vault_adapter.fetch_open_orders.assert_not_called()
+
+    def test_live_fetch_order_not_found_maps_to_retryable(self, vault_env):
+        from freqtrade.exceptions import RetryableOrderError
+
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_order.side_effect = ccxt.OrderNotFound("missing")
+        # count=0 disables the retrier's backoff loop for the test.
+        with pytest.raises(RetryableOrderError):
+            exchange.fetch_order("EX-7", "SOL/USD", count=0)
+
+    def test_live_fetch_order_exchange_error_maps_to_temporary(self, vault_env):
+        from freqtrade.exceptions import TemporaryError
+
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_order.side_effect = ccxt.ExchangeError("boom")
+        with pytest.raises(TemporaryError):
+            exchange.fetch_order("EX-7", "SOL/USD", count=0)
+
+    def test_live_fetch_open_orders_auth_error_maps_to_temporary(self, vault_env):
+        # ccxt.AuthenticationError subclasses ccxt.ExchangeError, so it maps
+        # to TemporaryError - identical to Freqtrade core's own mapping.
+        from freqtrade.exceptions import TemporaryError
+
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_open_orders.side_effect = ccxt.AuthenticationError("denied")
+        with pytest.raises(TemporaryError):
+            exchange.fetch_open_orders("SOL/USD")
+
+    def test_live_fetch_open_orders_base_error_maps_to_operational(self, vault_env):
+        from freqtrade.exceptions import OperationalException
+
+        exchange = self.make_exchange(dry_run=False)
+        exchange._vault_adapter.fetch_open_orders.side_effect = ccxt.BaseError("boom")
+        with pytest.raises(OperationalException):
+            exchange.fetch_open_orders("SOL/USD")
 
 
 # =============================================================================
