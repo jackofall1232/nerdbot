@@ -19,6 +19,24 @@ for forbidden_var in EXCHANGE_API_KEY EXCHANGE_API_SECRET EXCHANGE_API_PASSPHRAS
         CREDENTIAL_LEAK=1
     fi
 done
+
+# Freqtrade also reads FREQTRADE__* env overrides before normalising the
+# config - FREQTRADE__EXCHANGE__KEY / __SECRET / __PASSWORD / __UID (and
+# nested __CCXT_CONFIG__ keys) would smuggle raw credentials past the
+# guard above, and __NAME could swap the exchange away from the vault
+# adapter entirely. The exchange section is fully controlled by the
+# mounted config.json, so NO env override of it is legitimate here.
+while IFS= read -r env_name; do
+    case "${env_name}" in
+        FREQTRADE__EXCHANGE__*)
+            echo "FATAL: ${env_name} is set in the environment." >&2
+            echo "FATAL: Freqtrade exchange config overrides are not permitted in this container." >&2
+            echo "FATAL: the exchange section is fixed by the mounted config; credentials go through the nerdbot-vault proxy." >&2
+            CREDENTIAL_LEAK=1
+            ;;
+    esac
+done < <(compgen -e)
+
 if [ "${CREDENTIAL_LEAK}" -ne 0 ]; then
     exit 1
 fi

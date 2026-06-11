@@ -82,6 +82,34 @@ class TestCredentialGuard:
         assert "FATAL" in result.stderr
         assert "EXCHANGE_API_PASSPHRASE" in result.stderr
 
+    def test_freqtrade_exchange_env_override_triggers_fatal_exit(self):
+        """FREQTRADE__EXCHANGE__* overrides can carry raw credentials."""
+        for var in (
+            "FREQTRADE__EXCHANGE__KEY",
+            "FREQTRADE__EXCHANGE__SECRET",
+            "FREQTRADE__EXCHANGE__PASSWORD",
+            "FREQTRADE__EXCHANGE__UID",
+            "FREQTRADE__EXCHANGE__CCXT_CONFIG__APIKEY",
+            "FREQTRADE__EXCHANGE__NAME",
+        ):
+            env = dict(REQUIRED_ENV)
+            env[var] = "leaked-value"
+            result = run_script(env)
+            assert result.returncode == 1, var
+            assert "FATAL" in result.stderr, var
+            assert var in result.stderr, var
+
+    def test_non_exchange_freqtrade_overrides_are_allowed(self, tmp_path):
+        """Only the exchange section is locked down - other FREQTRADE__
+        overrides (e.g. logging) must not trip the guard."""
+        stub_dir = make_freqtrade_stub(tmp_path)
+        env = dict(REQUIRED_ENV)
+        env["FREQTRADE__INTERNALS__PROCESS_THROTTLE_SECS"] = "10"
+        env["PATH"] = f"{stub_dir}:/usr/bin:/bin"
+        result = run_script(env)
+        assert result.returncode == 0, result.stderr
+        assert "FATAL" not in result.stderr
+
     def test_guard_fires_even_with_credentials_and_no_vault_config(self):
         # The guard runs BEFORE required-var checks: a credentialed
         # environment must die with FATAL, not with a missing-var error.
