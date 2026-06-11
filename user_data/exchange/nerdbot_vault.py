@@ -62,8 +62,11 @@ SECURITY INVARIANTS
 - A FRESH lease is acquired before EVERY vault proxy call; leases are never
   cached or reused (vault TTL is ~30s; we treat each as single-use).
 - Lease acquisition failure raises ``ccxt.AuthenticationError``.
-- In paper mode, orders are NEVER sent to the vault (the vault rejects paper
-  keys for live orders); fills are simulated locally.
+- Paper mode never calls the vault for order placement/cancellation (orders
+  are simulated locally; the vault rejects paper keys for live orders), but
+  it still uses the vault for balance reads and startup credential
+  validation. Vault configuration is therefore required in paper mode too
+  (the backend always supplies the vault env vars).
 - The market-data path holds zero credentials.
 - The backend token is never logged.
 
@@ -247,13 +250,20 @@ class NerdbotVaultAdapter:
                 f"(order_id={response.get('order_id')!r})"
             )
 
+        order_id = response.get("order_id")
+        if not order_id:
+            # Do NOT silently return an empty id: the vault accepted the
+            # request, so an order may have been placed on the exchange.
+            # The caller must see an explicit error and reconcile.
+            raise ccxt.ExchangeError("vault response missing order_id")
+
         filled = float(response.get("filled_amount") or 0.0)
         avg_price = response.get("avg_price")
         average = float(avg_price) if avg_price is not None else None
         amount = float(amount)
         now_ms = int(time.time() * 1000)
         return {
-            "id": str(response["order_id"]),
+            "id": str(order_id),
             "clientOrderId": params.get("clientOrderId"),
             "timestamp": now_ms,
             "datetime": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now_ms / 1000)),
@@ -318,7 +328,11 @@ class NerdbotVaultAdapter:
         )
         result: dict = {"info": response, "free": {}, "used": {}, "total": {}}
         for entry in response.get("balances", []):
-            asset = entry["asset"]
+            asset = entry.get("asset")
+            if not asset:
+                # Required field per the vault contract; a malformed entry
+                # must surface as an explicit error, not a KeyError.
+                raise ccxt.ExchangeError("vault balance entry missing asset")
             free = float(entry.get("available") or 0.0)
             used = float(entry.get("locked") or 0.0)
             total = free + used
@@ -327,6 +341,18 @@ class NerdbotVaultAdapter:
             result["used"][asset] = used
             result["total"][asset] = total
         return result
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """
+        Release the vault HTTP client's connection pool.
+
+        Idempotent: safe to call multiple times.
+        """
+        self.vault_client.close()
 
     # ------------------------------------------------------------------
     # Market data / order info -> read-only ccxt (zero credentials)
@@ -348,13 +374,19 @@ class NerdbotVaultAdapter:
     def fetch_order(self, id: str, symbol: str | None = None, params: dict | None = None) -> dict:  # noqa: A002
         if self.is_paper_trading:
             return self.paper_simulator.get_order(id)
-        # Read-only ccxt instance: works only for exchanges/endpoints that
-        # expose order lookup publicly; the vault has no order-query API.
+        # KNOWN LIMITATION (pending a vault order-query endpoint): the vault
+        # proxy currently exposes no order-query API, so live order lookup
+        # falls back to the read-only ccxt instance. This works only for
+        # exchanges/endpoints that expose order lookup publicly; delegating
+        # to the vault here is intentionally deferred until that endpoint
+        # exists.
         return self.market_client.ccxt_exchange.fetch_order(id, symbol, params or {})
 
     def fetch_open_orders(self, symbol: str | None = None, params: dict | None = None) -> list:
         if self.is_paper_trading:
             return self.paper_simulator.get_open_orders(symbol)
+        # KNOWN LIMITATION: same as fetch_order above - no vault order-query
+        # endpoint yet, so this uses the public (credential-free) ccxt path.
         return self.market_client.ccxt_exchange.fetch_open_orders(symbol, params=params or {})
 
 
@@ -416,7 +448,10 @@ def register_ccxt_shim(real_exchange: str | None = None) -> bool:
         base_class = getattr(module, real_exchange)
         shim = _make_ccxt_shim(base_class)
         module.nerdbot_vault = shim
-        if "nerdbot_vault" not in module.exchanges:
+        # Some ccxt versions do not expose an ``exchanges`` list on every
+        # module (notably ccxt.async_support); guard so registration never
+        # crashes interpreter startup with an AttributeError.
+        if hasattr(module, "exchanges") and "nerdbot_vault" not in module.exchanges:
             module.exchanges.append("nerdbot_vault")
     # NOTE: deliberately NOT registered with ccxt.pro - Freqtrade falls back
     # to ccxt.async_support, and websockets are disabled via ft_has below.
@@ -433,8 +468,11 @@ if FREQTRADE_AVAILABLE:
         credential-free ccxt shim (real exchange public API). Credentialed
         operations are overridden to go through the vault proxy via
         ``NerdbotVaultAdapter``. With ``dry_run: true`` (paper configs),
-        Freqtrade's own local simulation handles orders/balances and the
-        vault is never called for them.
+        the vault is never called for order placement/cancellation -
+        Freqtrade's own local simulation handles orders - but
+        ``get_balances`` still reads real balances through the vault, and
+        startup credential validation always runs. Vault configuration is
+        therefore required in paper mode too.
         """
 
         _ft_has: dict = {
@@ -555,6 +593,14 @@ if FREQTRADE_AVAILABLE:
                 ) from e
             except ccxt.BaseError as e:
                 raise OperationalException(e) from e
+
+        def close(self):
+            """Close the vault adapter's HTTP client, then Freqtrade's own resources."""
+            try:
+                self._vault_adapter.close()
+            except Exception:
+                logger.exception("Failed to close vault adapter HTTP client")
+            super().close()
 
         def get_balances(self, params: dict | None = None):
             try:

@@ -25,6 +25,7 @@ from user_data.exchange.nerdbot_vault import (  # noqa: E402
     FREQTRADE_AVAILABLE,
     NerdbotVaultAdapter,
     register,
+    register_ccxt_shim,
 )
 from user_data.exchange.vault_http_client import VaultHTTPClient  # noqa: E402
 
@@ -170,6 +171,19 @@ class TestOrderRouting:
         with pytest.raises(ccxt.InvalidOrder):
             adapter.create_order("SOL/USDT", "limit", "buy", 1.0, 50.0)
 
+    @pytest.mark.parametrize("malformed", [{}, {"order_id": ""}, {"order_id": None}])
+    def test_missing_order_id_raises_exchange_error(self, vault_env, malformed):
+        client = make_vault_client_mock()
+        client.place_order.return_value = {
+            "status": "open",
+            "filled_amount": "0",
+            "avg_price": None,
+            **malformed,
+        }
+        adapter = make_adapter(vault_client=client)
+        with pytest.raises(ccxt.ExchangeError, match="missing order_id"):
+            adapter.create_order("SOL/USDT", "limit", "buy", 1.0, 50.0)
+
     def test_cancel_order_routes_through_vault(self, vault_env):
         client = make_vault_client_mock()
         adapter = make_adapter(vault_client=client)
@@ -267,6 +281,13 @@ class TestBalances:
         adapter = make_adapter()
         balance = adapter.fetch_balance()
         assert balance["free"] == {} and balance["used"] == {} and balance["total"] == {}
+
+    def test_balance_entry_missing_asset_raises_exchange_error(self, vault_env):
+        client = make_vault_client_mock()
+        client.get_balances.return_value = {"balances": [{"available": "1", "locked": "0"}]}
+        adapter = make_adapter(vault_client=client)
+        with pytest.raises(ccxt.ExchangeError, match="missing asset"):
+            adapter.fetch_balance()
 
 
 # =============================================================================
@@ -492,6 +513,87 @@ class TestVaultHTTPClientContract:
         with pytest.raises(ccxt.AuthenticationError) as excinfo:
             client.get_balances(VAULT_KEY_ID, "lease-1", BOT_ID, "binance")
         assert TOKEN not in str(excinfo.value)
+
+
+# =============================================================================
+# Resource cleanup: close() chain releases the httpx socket pool
+# =============================================================================
+
+
+class TestCloseChain:
+    def test_adapter_close_closes_vault_client(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.close()
+        client.close.assert_called_once_with()
+
+    def test_adapter_close_is_idempotent(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.close()
+        adapter.close()  # must not raise
+        assert client.close.call_count == 2
+
+    def test_http_client_close_closes_underlying_client_and_is_idempotent(self):
+        client = make_http_client(lambda request: httpx.Response(200, json={}))
+        underlying = client._client
+        assert not underlying.is_closed
+        client.close()
+        assert underlying.is_closed
+        client.close()  # second close must not raise
+
+    @pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+    def test_freqtrade_close_chains_adapter_then_super(self, vault_env):
+        from unittest.mock import patch
+
+        from freqtrade.exchange import Exchange
+        from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        exchange = object.__new__(Nerdbot_Vault)
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        exchange._exchange_ws = None
+        exchange._ws_async = None
+        exchange.loop = None
+        exchange._vault_adapter = MagicMock()
+        with patch.object(Exchange, "close") as super_close:
+            exchange.close()
+        exchange._vault_adapter.close.assert_called_once_with()
+        super_close.assert_called_once_with()
+
+    @pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+    def test_freqtrade_close_still_calls_super_if_adapter_close_fails(self, vault_env):
+        from unittest.mock import patch
+
+        from freqtrade.exchange import Exchange
+        from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        exchange = object.__new__(Nerdbot_Vault)
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        exchange._exchange_ws = None
+        exchange._ws_async = None
+        exchange.loop = None
+        exchange._vault_adapter = MagicMock()
+        exchange._vault_adapter.close.side_effect = RuntimeError("boom")
+        with patch.object(Exchange, "close") as super_close:
+            exchange.close()  # must not raise
+        super_close.assert_called_once_with()
+
+
+# =============================================================================
+# ccxt shim registration robustness
+# =============================================================================
+
+
+class TestShimRegistrationGuard:
+    def test_register_shim_survives_missing_exchanges_attribute(self, vault_env, monkeypatch):
+        # Some ccxt versions do not expose an ``exchanges`` list on
+        # ccxt.async_support; registration must not crash on AttributeError.
+        import ccxt.async_support as ccxt_async
+
+        monkeypatch.delattr(ccxt_async, "exchanges", raising=False)
+        assert register_ccxt_shim() is True
+        assert hasattr(ccxt_async, "nerdbot_vault")
+        assert "nerdbot_vault" in ccxt.exchanges
 
 
 # =============================================================================

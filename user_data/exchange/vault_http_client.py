@@ -82,6 +82,11 @@ class VaultHTTPClient:
         return f"VaultHTTPClient(base_url={self._base_url!r}, instance_id={self._instance_id!r})"
 
     def close(self) -> None:
+        """
+        Close the underlying httpx client, releasing its sockets.
+
+        Idempotent: httpx.Client.close() is safe to call repeatedly.
+        """
         self._client.close()
 
     # ------------------------------------------------------------------

@@ -25,6 +25,11 @@ fi
 
 # ---------------------------------------------------------------------------
 # Required vault/bot configuration.
+#
+# Required even when IS_PAPER_TRADING is set: paper mode never calls the
+# vault for order placement/cancellation (orders are simulated locally),
+# but still uses the vault for balance reads and startup credential
+# validation - so vault configuration is required in paper mode too.
 # ---------------------------------------------------------------------------
 : "${VAULT_BASE_URL:?VAULT_BASE_URL is required (nerdbot-vault base URL)}"
 : "${VAULT_KEY_ID:?VAULT_KEY_ID is required (vault key UUID)}"

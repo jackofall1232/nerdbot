@@ -137,6 +137,16 @@ class TestValidationAndFormat:
         with pytest.raises(ccxt.BadSymbol):
             simulator.simulate_order("SOLUSDT", "market", "buy", 1.0)
 
+    @pytest.mark.parametrize("bad_symbol", [None, "", 123])
+    def test_empty_none_or_non_string_symbol(self, simulator, bad_symbol):
+        with pytest.raises(ccxt.BadSymbol, match="empty or None"):
+            simulator.simulate_order(bad_symbol, "market", "buy", 1.0)
+
+    @pytest.mark.parametrize("bad_symbol", [None, "", 0, 1.5])
+    def test_split_symbol_guards_empty_and_non_string(self, bad_symbol):
+        with pytest.raises(ccxt.BadSymbol, match="empty or None"):
+            PaperTradingSimulator._split_symbol(bad_symbol)
+
     def test_get_balance_ccxt_format(self, simulator):
         balance = simulator.get_balance()
         assert set(balance) >= {"info", "free", "used", "total", "USDT"}

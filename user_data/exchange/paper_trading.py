@@ -4,7 +4,12 @@ In-memory paper-trading simulator.
 Used when IS_PAPER_TRADING is enabled: orders are NEVER sent to the vault
 (the vault rejects paper keys for live orders). Instead, fills are simulated
 locally against REAL market prices fetched through the zero-credential
-MarketDataClient, and balances are tracked in memory.
+MarketDataClient.
+
+NOTE: paper mode does not avoid the vault entirely. It never calls the
+vault for order placement/cancellation (orders are simulated here), but the
+adapter stack still uses the vault for balance reads and startup credential
+validation - vault configuration is therefore required in paper mode too.
 """
 
 import logging
@@ -56,6 +61,8 @@ class PaperTradingSimulator:
 
     @staticmethod
     def _split_symbol(symbol: str) -> tuple[str, str]:
+        if not symbol or not isinstance(symbol, str):
+            raise ccxt.BadSymbol("Symbol is empty or None")
         try:
             base, quote = symbol.split("/", 1)
         except ValueError as exc:
