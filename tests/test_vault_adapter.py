@@ -887,10 +887,17 @@ class TestCloseChain:
 
     @pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
     def test_freqtrade_close_chains_adapter_then_super(self, vault_env):
+        import gc
         from unittest.mock import patch
 
         from freqtrade.exchange import Exchange
         from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        # Exchange.__del__ calls self.close(); bare instances from earlier
+        # tests can finalize INSIDE the patch window below (observed on
+        # Python 3.14's GC timing), recording a phantom extra close call.
+        # Flush pending finalizers first so only this test's call counts.
+        gc.collect()
 
         exchange = object.__new__(Nerdbot_Vault)
         # Attributes Exchange.close()/__del__ dereference at GC time.
