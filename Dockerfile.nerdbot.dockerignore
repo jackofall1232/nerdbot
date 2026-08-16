@@ -1,0 +1,17 @@
+# Ignore file for Dockerfile.nerdbot builds ONLY (BuildKit picks
+# <Dockerfile>.dockerignore over .dockerignore for `-f Dockerfile.nerdbot`).
+# The stock .dockerignore excludes user_data/, which this image exists to
+# ship - so this file re-includes it while keeping the context minimal.
+# The stock Dockerfile and .dockerignore are deliberately untouched.
+
+# Exclude everything ...
+*
+
+# ... except the Nerdbot user_data overlay.
+!user_data/
+
+# Keep build-context junk out of the image.
+**/__pycache__
+**/*.pyc
+**/*.sqlite
+**/*.log

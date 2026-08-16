@@ -71,4 +71,6 @@ export PYTHONPATH="${ADAPTER_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 echo "Starting Freqtrade via nerdbot-vault proxy (exchange=${REAL_EXCHANGE}," \
      "bot_id=${BOT_ID}, paper=${IS_PAPER_TRADING:-0})"
 
-exec freqtrade trade --config /freqtrade/config/config.json --strategy "${STRATEGY:-SampleStrategy}"
+# Config mount path is LOCKED at /freqtrade/config.json (read-only bind by
+# the backend's container manager); default strategy is the Nerdbot flagship.
+exec freqtrade trade --config /freqtrade/config.json --strategy "${STRATEGY:-NerdbotStrategy}"

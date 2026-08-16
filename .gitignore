@@ -7,9 +7,9 @@ logfile.txt
 user_data/*
 !user_data/exchange/
 !user_data/scripts/
+!user_data/strategies/
 !user_data/config_templates/
 !user_data/config_templates/config_*.json
-!user_data/strategy/sample_strategy.py
 !user_data/notebooks
 !user_data/models
 !user_data/freqaimodels

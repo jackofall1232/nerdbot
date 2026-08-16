@@ -467,6 +467,8 @@ class NerdbotVaultAdapter:
 # =============================================================================
 
 try:
+    from copy import deepcopy
+
     from freqtrade.exceptions import (
         DDosProtection,
         InsufficientFundsError,
@@ -477,6 +479,7 @@ try:
     )
     from freqtrade.exchange import Exchange as _FreqtradeExchange
     from freqtrade.exchange.common import API_FETCH_ORDER_RETRY_COUNT, retrier
+    from freqtrade.misc import deep_merge_dicts
 
     FREQTRADE_AVAILABLE = True
 except ImportError:  # freqtrade (or its dependencies) not installed
@@ -533,6 +536,31 @@ def register_ccxt_shim(real_exchange: str | None = None) -> bool:
 
 
 if FREQTRADE_AVAILABLE:
+    # Data-correctness ``_ft_has`` quirks per REAL_EXCHANGE, mirrored from the
+    # corresponding freqtrade exchange subclasses (freqtrade/exchange/kraken.py).
+    # ``Nerdbot_Vault`` extends the GENERIC Exchange class, so the per-exchange
+    # subclasses' quirks would otherwise be silently lost even though market
+    # data flows through the real exchange's public API. Only entries that
+    # affect market DATA (candle fetching, pairlists, public trade downloads)
+    # are mirrored - order-execution quirks (``stoploss_on_exchange``, stop
+    # price params, ``order_time_in_force``) are deliberately NOT brought
+    # over, since orders route through Freqtrade dry-run or the vault proxy,
+    # never through native exchange order endpoints.
+    REAL_EXCHANGE_DATA_FT_HAS: dict[str, dict] = {
+        "kraken": {
+            # Kraken's OHLCV endpoint only serves the most recent ~720
+            # candles - historic candle downloads must be trade-based.
+            "ohlcv_has_history": False,
+            # Public trade-history pagination works by id, not by time.
+            "trades_pagination": "id",
+            "trades_pagination_arg": "since",
+            "trades_pagination_overlap": False,
+            "trades_has_history": True,
+        },
+        # binance / coinbase: the generic Exchange defaults are data-correct.
+        "binance": {},
+        "coinbase": {},
+    }
 
     class Nerdbot_Vault(_FreqtradeExchange):
         """
@@ -553,6 +581,74 @@ if FREQTRADE_AVAILABLE:
         _ft_has: dict = {
             "ws_enabled": False,  # no ccxt.pro class is registered for the shim
         }
+
+        @classmethod
+        def combine_ft_has(cls, include_futures: bool) -> dict:
+            """
+            Parent combination (class ``_ft_has`` over defaults), then merge
+            the REAL_EXCHANGE data-correctness quirks on top. Config-level
+            ``_ft_has_params`` overrides are applied afterwards by
+            ``build_ft_has`` and therefore still win. ``ws_enabled`` stays
+            False for every real exchange (set in ``_ft_has`` above, never
+            overridden by ``REAL_EXCHANGE_DATA_FT_HAS``).
+            """
+            ft_has = super().combine_ft_has(include_futures)
+            real_exchange = os.environ.get("REAL_EXCHANGE", "").strip().lower()
+            quirks = REAL_EXCHANGE_DATA_FT_HAS.get(real_exchange)
+            if quirks:
+                ft_has = deep_merge_dicts(deepcopy(quirks), ft_has)
+            return ft_has
+
+        @staticmethod
+        def _current_real_exchange() -> str:
+            """REAL_EXCHANGE env, normalized (same source combine_ft_has uses)."""
+            return os.environ.get("REAL_EXCHANGE", "").strip().lower()
+
+        # --------------------------------------------------------------
+        # Kraken trade-pagination method quirks (data path)
+        #
+        # The trades_pagination _ft_has flags mirrored above depend on two
+        # Kraken method overrides for id-based pagination to actually work
+        # (--dl-trades / trade-based candle downloads). Both are mirrored
+        # verbatim from freqtrade/exchange/kraken.py (Kraken class) and are
+        # active ONLY when REAL_EXCHANGE=kraken; every other exchange keeps
+        # the generic Exchange behavior. A drift-guard test compares this
+        # logic against the real Kraken class on sample inputs
+        # (tests/test_vault_adapter.py::TestKrakenTradePagination).
+        # --------------------------------------------------------------
+
+        def _get_trade_pagination_next_value(self, trades: list[dict]):
+            """
+            Extract the next "from_id" pagination value.
+
+            Kraken: the cursor is the trade response's "last" value, found
+            at the end of the raw info list; fall back to the timestamp
+            when info is somehow empty (mirrors Kraken class).
+            """
+            if self._current_real_exchange() != "kraken":
+                return super()._get_trade_pagination_next_value(trades)
+            if len(trades) > 0:
+                if isinstance(trades[-1].get("info"), list) and len(trades[-1].get("info", [])) > 7:
+                    # Trade response's "last" value.
+                    return trades[-1].get("info", [])[-1]
+                # Fall back to timestamp if info is somehow empty.
+                return trades[-1].get("timestamp")
+            return None
+
+        def _valid_trade_pagination_id(self, pair: str, from_id: str) -> bool:
+            """
+            Verify a trade-pagination id is valid.
+
+            Kraken: regular ids are 19+ char nanosecond timestamps (e.g.
+            1705443695120072285); shorter ids are invalid and force the
+            timestamp fallback (mirrors Kraken class).
+            """
+            if self._current_real_exchange() != "kraken":
+                return super()._valid_trade_pagination_id(pair, from_id)
+            if len(from_id) >= 19:
+                return True
+            logger.debug("%s - trade-pagination id is not valid. Fallback to timestamp.", pair)
+            return False
 
         def __init__(
             self, config, *, exchange_config=None, validate=True, load_leverage_tiers=False
