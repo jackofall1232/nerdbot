@@ -402,6 +402,9 @@ class TestAIFailurePaths:
             # entry instead of degrading - must be treated as malformed.
             {"pair": "SOL/USD", "timeframe": "5m", "score": False},
             {"pair": "SOL/USD", "timeframe": "5m", "score": True},
+            # The contract requires a JSON number - a numeric STRING like
+            # "0.2" must degrade, not veto.
+            {"pair": "SOL/USD", "timeframe": "5m", "score": "0.2"},
             ["not", "a", "dict"],
         ],
     )
@@ -508,6 +511,22 @@ class TestAIScoreCache:
         confirm(strategy, pair="BTC/USD")
         assert post.call_count == 2
 
+    def test_timeout_backoff_sheds_other_pairs(self, ai_env, monkeypatch):
+        # One stalled request must not cost every uncached pair its own
+        # deadline within the backoff window.
+        post = mock_post(monkeypatch, side_effect=requests_lib.exceptions.Timeout("slow"))
+        strategy = make_ai_strategy()
+        assert confirm(strategy, pair="SOL/USD") is True
+        assert confirm(strategy, pair="BTC/USD") is True
+        post.assert_called_once()  # second pair skipped via global backoff
+
+    def test_non_timeout_failures_do_not_back_off(self, ai_env, monkeypatch):
+        post = mock_post(monkeypatch, side_effect=requests_lib.exceptions.ConnectionError("down"))
+        strategy = make_ai_strategy()
+        assert confirm(strategy, pair="SOL/USD") is True
+        assert confirm(strategy, pair="BTC/USD") is True
+        assert post.call_count == 2  # fast failures keep trying per pair
+
     def test_failures_are_cached_per_candle(self, ai_env, monkeypatch):
         post = mock_post(monkeypatch, side_effect=requests_lib.exceptions.Timeout("slow"))
         strategy = make_ai_strategy()
@@ -519,6 +538,9 @@ class TestAIScoreCache:
         post = mock_post(monkeypatch, side_effect=requests_lib.exceptions.Timeout("slow"))
         strategy = make_ai_strategy()
         confirm(strategy)
+        # The 30s timeout backoff has long elapsed by the next 5m candle in
+        # real time; the test clock is instant, so model the expiry.
+        strategy._ai_backoff_until = 0.0
         confirm(strategy, current_time=CANDLE_TIME + timedelta(minutes=5))
         assert post.call_count == 2
 

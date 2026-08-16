@@ -66,6 +66,12 @@ AI_REQUEST_TIMEOUT: tuple[float, float] = (3.05, 5.0)
 AI_TOTAL_DEADLINE_SECONDS = 6.0
 AI_MAX_RESPONSE_BYTES = 65536
 
+#: After a timeout-class failure the AI layer is skipped for ALL pairs
+#: for this long: without it, a stalled service costs every uncached
+#: pair in the same entry pass its own full deadline (50 pairs -> 5+
+#: minutes of loop delay despite each request being individually capped).
+AI_FAILURE_BACKOFF_SECONDS = 30.0
+
 
 class NerdbotAIStrategy(NerdbotStrategy):
     """NerdbotStrategy with an nerdbot-ai score gate on long entries."""
@@ -88,6 +94,9 @@ class NerdbotAIStrategy(NerdbotStrategy):
         # block bot stop (a ThreadPoolExecutor worker would be). While a
         # wedged thread is still alive, AI is skipped (degrade), not queued.
         self._ai_inflight_thread: threading.Thread | None = None
+        # monotonic timestamp until which AI lookups are skipped entirely
+        # (set after timeout-class failures - see AI_FAILURE_BACKOFF_SECONDS).
+        self._ai_backoff_until = 0.0
 
     # ------------------------------------------------------------------
     # nerdbot-ai client (private helpers)
@@ -132,6 +141,10 @@ class NerdbotAIStrategy(NerdbotStrategy):
         if settings is None:
             return None
         url, token, exchange, is_pro = settings
+        if time.monotonic() < self._ai_backoff_until:
+            # A recent timeout-class failure: shed load for every pair
+            # instead of paying the full deadline once per pair.
+            return None
         failure_name = "Error"
         try:
             inflight = self._ai_inflight_thread
@@ -170,10 +183,16 @@ class NerdbotAIStrategy(NerdbotStrategy):
             failure_name = str(outcome.get("failure", "Error"))
             raise RuntimeError("AI request failed")
         except Exception as exc:
+            reported = failure_name if type(exc).__name__ == "RuntimeError" else type(exc).__name__
+            if isinstance(exc, TimeoutError) or "Timeout" in reported:
+                # Slow-failure class: back off globally so one stalled
+                # service costs a single deadline per backoff window, not
+                # one per uncached pair.
+                self._ai_backoff_until = time.monotonic() + AI_FAILURE_BACKOFF_SECONDS
             logger.debug(
                 "nerdbot-ai call failed for %s (%s) - using standard NerdbotStrategy signals",
                 pair,
-                failure_name if type(exc).__name__ == "RuntimeError" else type(exc).__name__,
+                reported,
             )
             return None
 
@@ -218,7 +237,7 @@ class NerdbotAIStrategy(NerdbotStrategy):
         score_raw = payload["score"]
         # bool is an int subclass: float(False) == 0.0 would VETO instead
         # of degrading - a boolean score is malformed, not a decision.
-        if isinstance(score_raw, bool) or not isinstance(score_raw, (int, float, str)):
+        if isinstance(score_raw, bool) or not isinstance(score_raw, (int, float)):
             raise ValueError("AI score is not numeric")
         score = float(score_raw)
         if not 0.0 <= score <= 1.0:
