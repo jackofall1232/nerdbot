@@ -8,6 +8,7 @@ dependency.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -131,23 +132,44 @@ class TestOrderRouting:
         adapter = make_adapter(vault_client=client)
         order = adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
 
-        client.place_order.assert_called_once_with(
-            vault_key_id=VAULT_KEY_ID,
-            lease_id="lease-2",  # fresh lease, not the init lease
-            bot_id=BOT_ID,
-            exchange="binance",
-            symbol="SOL/USDT",
-            side="buy",
-            type="limit",
-            amount=2.0,
-            price=100.0,
-            client_order_id=None,
-        )
+        kwargs = client.place_order.call_args.kwargs
+        generated_id = kwargs.pop("client_order_id")
+        assert kwargs == {
+            "vault_key_id": VAULT_KEY_ID,
+            "lease_id": "lease-2",  # fresh lease, not the init lease
+            "bot_id": BOT_ID,
+            "exchange": "binance",
+            "symbol": "SOL/USDT",
+            "side": "buy",
+            "type": "limit",
+            "amount": 2.0,
+            "price": 100.0,
+        }
+        # A client order id is ALWAYS sent (exchange-side dedupe makes the
+        # vault->exchange leg retry-safe); minted ids satisfy the strictest
+        # exchange format: alphanumeric, 32 chars.
+        assert re.fullmatch(r"nb[0-9a-f]{30}", generated_id)
         assert order["id"] == "EX-1"
         assert order["status"] == "open"
         assert order["symbol"] == "SOL/USDT"
         assert order["amount"] == 2.0
         assert order["remaining"] == 2.0
+
+    def test_caller_supplied_client_order_id_passes_through(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.create_order(
+            "SOL/USDT", "limit", "buy", 2.0, 100.0, {"clientOrderId": "mycustomid1"}
+        )
+        assert client.place_order.call_args.kwargs["client_order_id"] == "mycustomid1"
+
+    def test_minted_client_order_ids_are_unique_per_call(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
+        adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
+        first, second = (c.kwargs["client_order_id"] for c in client.place_order.call_args_list)
+        assert first != second
 
     def test_filled_vault_status_maps_to_closed(self, vault_env):
         client = make_vault_client_mock()

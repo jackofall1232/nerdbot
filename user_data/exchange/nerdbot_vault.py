@@ -77,6 +77,7 @@ SECURITY INVARIANTS
 import logging
 import os
 import time
+import uuid
 from typing import cast
 
 
@@ -284,7 +285,18 @@ class NerdbotVaultAdapter:
             type=type,
             amount=amount,
             price=price,
-            client_order_id=params.get("clientOrderId") or params.get("client_order_id"),
+            # Always send a client order id: exchanges dedupe on it, so the
+            # vault->exchange leg is retry-safe (an accepted-but-timed-out
+            # placement cannot silently duplicate). Freqtrade supplies no
+            # order-intent id, so a fresh one is minted per call - "nb" +
+            # 30 hex chars satisfies the strictest format (Kraken:
+            # alphanumeric, <= 32). Lets the vault's REQUIRE_CLIENT_ORDER_ID
+            # be enabled at deploy time.
+            client_order_id=(
+                params.get("clientOrderId")
+                or params.get("client_order_id")
+                or f"nb{uuid.uuid4().hex[:30]}"
+            ),
         )
 
         status = _VAULT_ORDER_STATUS_TO_CCXT.get(response.get("status"), "open")
