@@ -886,6 +886,17 @@ class TestVaultHTTPClientContract:
 
 
 class TestCloseChain:
+    @pytest.fixture(autouse=True)
+    def _flush_pending_finalizers(self):
+        # Exchange.__del__ calls self.close(); bare Nerdbot_Vault instances
+        # from earlier tests can finalize INSIDE the patch.object windows
+        # below (observed on Python 3.12 and 3.14 GC timing), recording
+        # phantom extra close calls. Flush pending finalizers first so only
+        # each test's own calls count.
+        import gc
+
+        gc.collect()
+
     def test_adapter_close_closes_vault_client(self, vault_env):
         client = make_vault_client_mock()
         adapter = make_adapter(vault_client=client)
@@ -909,17 +920,10 @@ class TestCloseChain:
 
     @pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
     def test_freqtrade_close_chains_adapter_then_super(self, vault_env):
-        import gc
         from unittest.mock import patch
 
         from freqtrade.exchange import Exchange
         from user_data.exchange.nerdbot_vault import Nerdbot_Vault
-
-        # Exchange.__del__ calls self.close(); bare instances from earlier
-        # tests can finalize INSIDE the patch window below (observed on
-        # Python 3.14's GC timing), recording a phantom extra close call.
-        # Flush pending finalizers first so only this test's call counts.
-        gc.collect()
 
         exchange = object.__new__(Nerdbot_Vault)
         # Attributes Exchange.close()/__del__ dereference at GC time.
