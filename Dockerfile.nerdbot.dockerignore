@@ -19,7 +19,18 @@
 !user_data/strategies/
 !user_data/config_templates/
 
+# Belt-and-braces recursive re-includes: moby/patternmatcher applies
+# parent-directory matching to negated patterns, so the directory forms
+# above should already re-include the files beneath them - but a build
+# cannot be exercised in this environment (registry egress blocked), so
+# the explicit ** forms remove any dependence on that behavior.
+!user_data/exchange/**
+!user_data/scripts/**
+!user_data/strategies/**
+!user_data/config_templates/**
+
 # CI-generated sample strategies and build-context junk must never ship.
+# These stay LAST so they win over the re-includes above.
 user_data/strategies/Awesome*
 **/__pycache__
 **/*.pyc

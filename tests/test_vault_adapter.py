@@ -1133,6 +1133,30 @@ class TestRealExchangeFtHas:
         ft_has = self.build_ft_has(monkeypatch, "binance")
         assert ft_has["ohlcv_has_history"] is True
 
+    def test_binance_inherits_l2_limit_range(self, vault_env, monkeypatch):
+        # Binance's order-book endpoint only accepts discrete depth limits;
+        # order_book_top: 1 must be rounded up (to 5), not forwarded raw.
+        ft_has = self.build_ft_has(monkeypatch, "binance")
+        assert ft_has["l2_limit_range"] == [5, 10, 20, 50, 100, 500, 1000]
+
+    def test_binance_l2_limit_range_matches_binance_class_source(self, vault_env, monkeypatch):
+        # Guard against upstream drift: identical to the real Binance class.
+        from freqtrade.exchange.binance import Binance
+
+        ft_has = self.build_ft_has(monkeypatch, "binance")
+        assert ft_has["l2_limit_range"] == Binance._ft_has["l2_limit_range"]
+
+    @pytest.mark.parametrize("real_exchange", ["kraken", "coinbase"])
+    def test_l2_limit_range_stays_generic_elsewhere(self, vault_env, monkeypatch, real_exchange):
+        # Upstream Kraken defines no l2_limit_range (checked against
+        # freqtrade/exchange/kraken.py) and coinbase has no freqtrade
+        # subclass - both keep the generic None (no limit rounding).
+        from freqtrade.exchange.kraken import Kraken
+
+        assert "l2_limit_range" not in Kraken._ft_has  # upstream-drift guard
+        ft_has = self.build_ft_has(monkeypatch, real_exchange)
+        assert ft_has["l2_limit_range"] is None
+
     @pytest.mark.parametrize("real_exchange", ["binance", "kraken", "coinbase"])
     def test_ws_disabled_for_every_real_exchange(self, vault_env, monkeypatch, real_exchange):
         ft_has = self.build_ft_has(monkeypatch, real_exchange)
@@ -1253,6 +1277,84 @@ class TestKrakenTradePagination:
         trades = [{"id": "abc", "timestamp": 1705443695120, "info": ["x"] * 9}]
         assert exchange._get_trade_pagination_next_value(trades) == 1705443695120
         assert exchange._valid_trade_pagination_id("SOL/USD", "short-id") is True
+
+
+# =============================================================================
+# Kraken dark-pool filter (market_is_tradable, mirrored from Kraken class)
+# =============================================================================
+
+
+@pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+class TestMarketIsTradable:
+    """
+    Kraken lists dark-pool pairs that must never be tradable; upstream
+    filters them in Kraken.market_is_tradable. Nerdbot_Vault mirrors the
+    filter for REAL_EXCHANGE=kraken only; a drift-guard test compares
+    behavior against the real Kraken class on the same market dicts.
+    """
+
+    SPOT_MARKET = {
+        "quote": "USD",
+        "base": "SOL",
+        "spot": True,
+        "precision": {"price": 0.01},
+    }
+
+    SAMPLE_MARKETS = [
+        SPOT_MARKET,  # plain tradable spot market
+        {**SPOT_MARKET, "darkpool": False},  # explicit non-darkpool
+        {**SPOT_MARKET, "darkpool": True},  # dark-pool pair
+        {**SPOT_MARKET, "base": None},  # untradable regardless of darkpool
+    ]
+
+    @staticmethod
+    def prepare(exchange):
+        """Set the attributes generic market_is_tradable dereferences."""
+        from freqtrade.enums import TradingMode
+
+        exchange.trading_mode = TradingMode.SPOT
+        # precisionMode is a property reading self._api.precisionMode;
+        # 2 = ccxt DECIMAL_PLACES (not TICK_SIZE), so the precision branch
+        # of the generic checks short-circuits deterministically.
+        exchange._api = MagicMock(precisionMode=2)
+        return exchange
+
+    def make_vault_exchange(self, monkeypatch, real_exchange: str):
+        return self.prepare(
+            TestKrakenTradePagination.make_vault_exchange(monkeypatch, real_exchange)
+        )
+
+    def make_kraken(self):
+        return self.prepare(TestKrakenTradePagination.make_kraken())
+
+    def test_kraken_rejects_darkpool_markets(self, vault_env, monkeypatch):
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange.market_is_tradable({**self.SPOT_MARKET, "darkpool": True}) is False
+
+    def test_kraken_accepts_regular_markets(self, vault_env, monkeypatch):
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange.market_is_tradable(dict(self.SPOT_MARKET)) is True
+        assert exchange.market_is_tradable({**self.SPOT_MARKET, "darkpool": False}) is True
+
+    @pytest.mark.parametrize("market", SAMPLE_MARKETS)
+    def test_kraken_matches_kraken_class_source(self, vault_env, monkeypatch, market):
+        # Drift guard: identical verdict to the real Kraken class.
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange.market_is_tradable(dict(market)) is (
+            self.make_kraken().market_is_tradable(dict(market))
+        )
+
+    @pytest.mark.parametrize("real_exchange", ["binance", "coinbase"])
+    def test_other_exchanges_ignore_darkpool_flag(self, vault_env, monkeypatch, real_exchange):
+        # The darkpool key is Kraken-specific; other exchanges keep the
+        # generic verdict even if a market dict happens to carry it.
+        exchange = self.make_vault_exchange(monkeypatch, real_exchange)
+        assert exchange.market_is_tradable({**self.SPOT_MARKET, "darkpool": True}) is True
+
+    def test_generic_untradable_stays_untradable_on_kraken(self, vault_env, monkeypatch):
+        # The mirror only ANDs the darkpool filter onto the generic checks.
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange.market_is_tradable({**self.SPOT_MARKET, "base": None}) is False
 
 
 # =============================================================================

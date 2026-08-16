@@ -285,13 +285,21 @@ class NerdbotVaultAdapter:
             type=type,
             amount=amount,
             price=price,
-            # Always send a client order id: exchanges dedupe on it, so the
-            # vault->exchange leg is retry-safe (an accepted-but-timed-out
-            # placement cannot silently duplicate). Freqtrade supplies no
-            # order-intent id, so a fresh one is minted per call - "nb" +
-            # 30 hex chars satisfies the strictest format (Kraken:
-            # alphanumeric, <= 32). Lets the vault's REQUIRE_CLIENT_ORDER_ID
-            # be enabled at deploy time.
+            # Always send a client order id: exchanges dedupe on it, which
+            # makes retries WITHIN this single placement safe - the vault
+            # (or its exchange SDK) can retry ITS exchange call for this
+            # request without duplicating, even if the exchange accepted an
+            # attempt whose response was lost. It does NOT deduplicate
+            # across separate create_order calls: this adapter sends
+            # exactly one vault POST per call (VaultHTTPClient never
+            # retries), a lost engine->vault response surfaces as a ccxt
+            # NetworkError -> TemporaryError, and a later re-entry by
+            # freqtrade is a genuinely new order with a fresh id - the
+            # same semantics as stock freqtrade+ccxt on any exchange
+            # (freqtrade has no persisted order-intent id to reuse).
+            # A fresh id is minted per call - "nb" + 30 hex chars satisfies
+            # the strictest format (Kraken: alphanumeric, <= 32). Lets the
+            # vault's REQUIRE_CLIENT_ORDER_ID be enabled at deploy time.
             client_order_id=(
                 params.get("clientOrderId")
                 or params.get("client_order_id")
@@ -582,9 +590,19 @@ if FREQTRADE_AVAILABLE:
             "trades_pagination_arg": "since",
             "trades_pagination_overlap": False,
             "trades_has_history": True,
+            # NOTE: upstream Kraken defines no l2_limit_range - the generic
+            # None (no order-book limit rounding) is correct for kraken.
         },
-        # binance / coinbase: the generic Exchange defaults are data-correct.
-        "binance": {},
+        "binance": {
+            # Order-book depth requests must use one of Binance's discrete
+            # limits (mirrors freqtrade/exchange/binance.py). The generic
+            # None would forward e.g. limit=1 (order_book_top: 1 in the
+            # entry/exit pricing config) to ccxt un-rounded; with the range
+            # set, Exchange.fetch_l2_order_book rounds it up to 5.
+            "l2_limit_range": [5, 10, 20, 50, 100, 500, 1000],
+        },
+        # coinbase: no freqtrade subclass exists - generic defaults are
+        # data-correct.
         "coinbase": {},
     }
 
@@ -675,6 +693,22 @@ if FREQTRADE_AVAILABLE:
                 return True
             logger.debug("%s - trade-pagination id is not valid. Fallback to timestamp.", pair)
             return False
+
+        def market_is_tradable(self, market: dict) -> bool:
+            """
+            Generic tradability checks, plus Kraken's dark-pool filter.
+
+            Mirrors Kraken.market_is_tradable (freqtrade/exchange/kraken.py):
+            dark-pool pairs (``market["darkpool"]`` truthy) must never be
+            tradable - they would otherwise leak into pairlists when
+            REAL_EXCHANGE=kraken. Every other exchange keeps the generic
+            Exchange behavior. Drift-guard test:
+            tests/test_vault_adapter.py::TestMarketIsTradable.
+            """
+            parent_check = super().market_is_tradable(market)
+            if self._current_real_exchange() != "kraken":
+                return parent_check
+            return parent_check and market.get("darkpool", False) is False
 
         def __init__(
             self, config, *, exchange_config=None, validate=True, load_leverage_tiers=False
