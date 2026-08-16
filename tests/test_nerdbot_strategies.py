@@ -398,6 +398,10 @@ class TestAIFailurePaths:
             {"score": None},
             {"score": 1.5},  # out of [0, 1]
             {"score": -0.2},
+            # bool is an int subclass: float(False) == 0.0 would veto the
+            # entry instead of degrading - must be treated as malformed.
+            {"pair": "SOL/USD", "timeframe": "5m", "score": False},
+            {"pair": "SOL/USD", "timeframe": "5m", "score": True},
             ["not", "a", "dict"],
         ],
     )
@@ -437,6 +441,36 @@ class TestAIFailurePaths:
         response.iter_content.side_effect = lambda chunk_size=4096: iter([b"{", b"}"])
         mock_post(monkeypatch, response)
         assert confirm(make_ai_strategy()) is True
+
+    def test_hung_request_cannot_stall_the_loop(self, ai_env, monkeypatch):
+        # Even a server that drips response HEADERS (which no requests
+        # timeout fully bounds) only wedges the worker thread: the trading
+        # loop abandons the future at the hard deadline and later calls
+        # skip AI entirely while the worker is still stuck.
+        import threading
+
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def hung_post(*args, **kwargs):
+            calls["n"] += 1
+            release.wait(timeout=10)
+            raise requests_lib.exceptions.ConnectionError("released")
+
+        monkeypatch.setattr(ai_module, "AI_TOTAL_DEADLINE_SECONDS", 0.05)
+        monkeypatch.setattr(ai_module.requests.Session, "post", hung_post)
+        strategy = make_ai_strategy()
+        try:
+            # First call: worker hangs, loop degrades at the deadline.
+            assert confirm(strategy) is True
+            assert strategy._ai_inflight is not None
+            # Next candle: worker still wedged -> AI skipped, no new call.
+            later = CANDLE_TIME + timedelta(minutes=5)
+            assert confirm(strategy, current_time=later) is True
+            assert calls["n"] == 1
+        finally:
+            release.set()
+            strategy._ai_executor.shutdown(wait=True)
 
     def test_failure_logged_at_debug_only(self, ai_env, monkeypatch, caplog):
         mock_post(monkeypatch, side_effect=requests_lib.exceptions.Timeout("slow"))

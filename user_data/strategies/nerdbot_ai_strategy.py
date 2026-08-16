@@ -33,6 +33,8 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 
 import requests
@@ -55,10 +57,13 @@ AI_SCORE_ENTRY_THRESHOLD = 0.55
 AI_REQUEST_TIMEOUT: tuple[float, float] = (3.05, 5.0)
 
 #: The read timeout above only caps the gap BETWEEN bytes - a server that
-#: drips one byte every few seconds would never trip it. The body is
-#: therefore streamed against this total wall-clock deadline (and a size
-#: cap far above any real /features payload) so confirm_trade_entry can
-#: never stall the trading loop.
+#: drips one byte every few seconds would never trip it. Two further layers
+#: therefore bound the call: the body is streamed against this wall-clock
+#: deadline (and a size cap far above any real /features payload), and the
+#: WHOLE request runs on a dedicated worker thread that the trading loop
+#: waits on for at most AI_TOTAL_DEADLINE_SECONDS - even a server dripping
+#: response HEADERS (which no requests timeout fully bounds) can only stall
+#: the worker, never confirm_trade_entry.
 AI_TOTAL_DEADLINE_SECONDS = 6.0
 AI_MAX_RESPONSE_BYTES = 65536
 
@@ -78,6 +83,11 @@ class NerdbotAIStrategy(NerdbotStrategy):
         # One session per bot lifetime: reuses the TCP/TLS connection to
         # nerdbot-ai instead of a fresh handshake every candle.
         self._ai_session = requests.Session()
+        # Single worker so the trading loop can abandon a stuck request via
+        # future.result(timeout=...). If the worker is still wedged when the
+        # next call arrives, AI is skipped (degrade) instead of queueing.
+        self._ai_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nerdbot-ai")
+        self._ai_inflight: Future | None = None
 
     # ------------------------------------------------------------------
     # nerdbot-ai client (private helpers)
@@ -111,53 +121,34 @@ class NerdbotAIStrategy(NerdbotStrategy):
         """
         Call POST {AI_SERVICE_URL}/features and return the score in [0, 1].
 
-        Returns None on ANY failure. SECURITY: the bearer token must never
-        appear in logs or propagate inside an exception - only the exception
-        CLASS name is ever logged, never its message or headers.
+        Returns None on ANY failure. The blocking request runs on the
+        dedicated worker thread and is abandoned (not awaited) once the
+        total deadline passes, so the trading loop's wait is hard-bounded.
+        SECURITY: the bearer token must never appear in logs or propagate
+        inside an exception - only the exception CLASS name is ever logged,
+        never its message or headers.
         """
         settings = self._ai_service_settings()
         if settings is None:
             return None
         url, token, exchange, is_pro = settings
         try:
-            response = self._ai_session.post(
-                f"{url}/features",
-                json={
-                    "pair": pair,
-                    "timeframe": self.timeframe,
-                    "exchange": exchange,
-                    "is_pro": is_pro,
-                },
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=AI_REQUEST_TIMEOUT,
-                # The service never redirects; following one could resend
-                # the bearer token to an unexpected host.
-                allow_redirects=False,
-                # Streamed so the body read below can enforce a TOTAL
-                # wall-clock deadline (the read timeout is only per-gap).
-                stream=True,
+            if self._ai_inflight is not None:
+                if not self._ai_inflight.done():
+                    # A previous request is still wedged in the worker -
+                    # skip AI entirely rather than queueing behind it.
+                    raise TimeoutError("previous AI request still in flight")
+                self._ai_inflight = None
+            future = self._ai_executor.submit(
+                self._fetch_ai_score_blocking, pair, url, token, exchange, is_pro
             )
             try:
-                response.raise_for_status()
-                deadline = time.monotonic() + AI_TOTAL_DEADLINE_SECONDS
-                body = bytearray()
-                for chunk in response.iter_content(chunk_size=4096):
-                    body.extend(chunk)
-                    if time.monotonic() > deadline:
-                        raise TimeoutError("AI response exceeded total deadline")
-                    if len(body) > AI_MAX_RESPONSE_BYTES:
-                        raise ValueError("AI response too large")
-            finally:
-                response.close()
-            payload = json.loads(bytes(body))
-            # A stale or misrouted response for another market must never
-            # gate this pair's entry - treat it as malformed.
-            if payload.get("pair") != pair or payload.get("timeframe") != self.timeframe:
-                raise ValueError("AI response identity mismatch")
-            score = float(payload["score"])
-            if not 0.0 <= score <= 1.0:
-                raise ValueError("score out of range")
-            return score
+                # Small grace over the in-request deadline so the worker's
+                # own (tighter) limits normally fire first.
+                return future.result(timeout=AI_TOTAL_DEADLINE_SECONDS + 0.5)
+            except FutureTimeoutError:
+                self._ai_inflight = future
+                raise TimeoutError("AI request exceeded total deadline") from None
         except Exception as exc:
             logger.debug(
                 "nerdbot-ai call failed for %s (%s) - using standard NerdbotStrategy signals",
@@ -165,6 +156,54 @@ class NerdbotAIStrategy(NerdbotStrategy):
                 type(exc).__name__,
             )
             return None
+
+    def _fetch_ai_score_blocking(
+        self, pair: str, url: str, token: str, exchange: str, is_pro: bool
+    ) -> float:
+        """Worker-thread body: the actual HTTP call. Raises on any failure."""
+        response = self._ai_session.post(
+            f"{url}/features",
+            json={
+                "pair": pair,
+                "timeframe": self.timeframe,
+                "exchange": exchange,
+                "is_pro": is_pro,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=AI_REQUEST_TIMEOUT,
+            # The service never redirects; following one could resend
+            # the bearer token to an unexpected host.
+            allow_redirects=False,
+            # Streamed so the body read below can enforce a TOTAL
+            # wall-clock deadline (the read timeout is only per-gap).
+            stream=True,
+        )
+        try:
+            response.raise_for_status()
+            deadline = time.monotonic() + AI_TOTAL_DEADLINE_SECONDS
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=4096):
+                body.extend(chunk)
+                if time.monotonic() > deadline:
+                    raise TimeoutError("AI response exceeded total deadline")
+                if len(body) > AI_MAX_RESPONSE_BYTES:
+                    raise ValueError("AI response too large")
+        finally:
+            response.close()
+        payload = json.loads(bytes(body))
+        # A stale or misrouted response for another market must never
+        # gate this pair's entry - treat it as malformed.
+        if payload.get("pair") != pair or payload.get("timeframe") != self.timeframe:
+            raise ValueError("AI response identity mismatch")
+        score_raw = payload["score"]
+        # bool is an int subclass: float(False) == 0.0 would VETO instead
+        # of degrading - a boolean score is malformed, not a decision.
+        if isinstance(score_raw, bool) or not isinstance(score_raw, (int, float, str)):
+            raise ValueError("AI score is not numeric")
+        score = float(score_raw)
+        if not 0.0 <= score <= 1.0:
+            raise ValueError("score out of range")
+        return score
 
     def _ai_score(self, pair: str, current_time: datetime) -> float | None:
         """
