@@ -40,18 +40,31 @@ FROM ${BASE_IMAGE}
 COPY --chown=ftuser:ftuser user_data/ /freqtrade/user_data/
 
 # Ensure the entrypoint is executable regardless of checkout permissions,
-# and pre-create every directory freqtrade mkdirs at startup that the repo
-# checkout does not ship (plot/, hyperopt_results/): the backend runs bot
-# containers with a READ-ONLY root filesystem, so any directory missing
-# from the image would make `freqtrade trade` die with OSError at boot.
+# and pre-create the COMPLETE runtime tree freqtrade mkdirs at startup: the
+# backend runs bot containers with a READ-ONLY root filesystem, so any
+# directory missing from the image makes `freqtrade trade` die with OSError
+# at boot. The list mirrors create_userdata_dir's sub_dirs
+# (freqtrade/configuration/directory_operations.py) plus create_datadir's
+# per-exchange dir (exchange name is always "nerdbot_vault" here) - the
+# whitelist dockerignore ships only the four overlay dirs, so everything
+# else must be created explicitly.
 # /freqtrade/data is created owned by ftuser because the backend mounts a
 # fresh named volume there for the sqlite db - Docker initializes an empty
 # volume's ownership from the image path, so baking in ftuser ownership is
 # what makes the db writable by the non-root bot.
 USER root
 RUN chmod 0755 /freqtrade/user_data/scripts/start_bot.sh \
-  && mkdir -p /freqtrade/user_data/plot /freqtrade/user_data/hyperopt_results /freqtrade/data \
-  && chown -R ftuser:ftuser /freqtrade/user_data/plot /freqtrade/user_data/hyperopt_results /freqtrade/data
+  && mkdir -p \
+    /freqtrade/user_data/backtest_results \
+    /freqtrade/user_data/data/nerdbot_vault \
+    /freqtrade/user_data/hyperopts \
+    /freqtrade/user_data/hyperopt_results \
+    /freqtrade/user_data/logs \
+    /freqtrade/user_data/notebooks \
+    /freqtrade/user_data/plot \
+    /freqtrade/user_data/freqaimodels \
+    /freqtrade/data \
+  && chown -R ftuser:ftuser /freqtrade/user_data /freqtrade/data
 
 # Preserve the upstream convention: never run as root. The container MUST
 # run as uid 1000 (ftuser): freqtrade is pip-installed with --user into

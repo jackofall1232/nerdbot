@@ -32,9 +32,8 @@ included - so each pair triggers at most one HTTP call per candle.
 import json
 import logging
 import os
+import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 
 import requests
@@ -83,11 +82,12 @@ class NerdbotAIStrategy(NerdbotStrategy):
         # One session per bot lifetime: reuses the TCP/TLS connection to
         # nerdbot-ai instead of a fresh handshake every candle.
         self._ai_session = requests.Session()
-        # Single worker so the trading loop can abandon a stuck request via
-        # future.result(timeout=...). If the worker is still wedged when the
-        # next call arrives, AI is skipped (degrade) instead of queueing.
-        self._ai_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nerdbot-ai")
-        self._ai_inflight: Future | None = None
+        # The request runs on a short-lived DAEMON thread the trading loop
+        # waits on for at most the total deadline. Daemon threads are never
+        # joined at interpreter shutdown, so a wedged request can never
+        # block bot stop (a ThreadPoolExecutor worker would be). While a
+        # wedged thread is still alive, AI is skipped (degrade), not queued.
+        self._ai_inflight_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # nerdbot-ai client (private helpers)
@@ -132,28 +132,48 @@ class NerdbotAIStrategy(NerdbotStrategy):
         if settings is None:
             return None
         url, token, exchange, is_pro = settings
+        failure_name = "Error"
         try:
-            if self._ai_inflight is not None:
-                if not self._ai_inflight.done():
-                    # A previous request is still wedged in the worker -
-                    # skip AI entirely rather than queueing behind it.
-                    raise TimeoutError("previous AI request still in flight")
-                self._ai_inflight = None
-            future = self._ai_executor.submit(
-                self._fetch_ai_score_blocking, pair, url, token, exchange, is_pro
-            )
-            try:
-                # Small grace over the in-request deadline so the worker's
-                # own (tighter) limits normally fire first.
-                return future.result(timeout=AI_TOTAL_DEADLINE_SECONDS + 0.5)
-            except FutureTimeoutError:
-                self._ai_inflight = future
-                raise TimeoutError("AI request exceeded total deadline") from None
+            inflight = self._ai_inflight_thread
+            if inflight is not None and inflight.is_alive():
+                # A previous request is still wedged - skip AI entirely
+                # rather than stacking threads behind it.
+                raise TimeoutError("previous AI request still in flight")
+            self._ai_inflight_thread = None
+
+            # SECURITY: only the failure's CLASS NAME crosses the thread
+            # boundary - never the exception object (its message could
+            # embed header/token material).
+            outcome: dict[str, object] = {}
+            done = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    outcome["score"] = self._fetch_ai_score_blocking(
+                        pair, url, token, exchange, is_pro
+                    )
+                except BaseException as exc:
+                    outcome["failure"] = type(exc).__name__
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=_worker, name="nerdbot-ai", daemon=True)
+            thread.start()
+            # Small grace over the in-request deadline so the worker's own
+            # (tighter) limits normally fire first.
+            if not done.wait(AI_TOTAL_DEADLINE_SECONDS + 0.5):
+                self._ai_inflight_thread = thread
+                raise TimeoutError("AI request exceeded total deadline")
+            score = outcome.get("score")
+            if isinstance(score, float):
+                return score
+            failure_name = str(outcome.get("failure", "Error"))
+            raise RuntimeError("AI request failed")
         except Exception as exc:
             logger.debug(
                 "nerdbot-ai call failed for %s (%s) - using standard NerdbotStrategy signals",
                 pair,
-                type(exc).__name__,
+                failure_name if type(exc).__name__ == "RuntimeError" else type(exc).__name__,
             )
             return None
 

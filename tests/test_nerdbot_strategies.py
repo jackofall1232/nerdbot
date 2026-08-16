@@ -463,14 +463,18 @@ class TestAIFailurePaths:
         try:
             # First call: worker hangs, loop degrades at the deadline.
             assert confirm(strategy) is True
-            assert strategy._ai_inflight is not None
+            inflight = strategy._ai_inflight_thread
+            assert inflight is not None
+            # Daemon thread: interpreter shutdown never joins it, so a
+            # wedged request cannot block bot stop.
+            assert inflight.daemon is True
             # Next candle: worker still wedged -> AI skipped, no new call.
             later = CANDLE_TIME + timedelta(minutes=5)
             assert confirm(strategy, current_time=later) is True
             assert calls["n"] == 1
         finally:
             release.set()
-            strategy._ai_executor.shutdown(wait=True)
+            inflight.join(timeout=5)
 
     def test_failure_logged_at_debug_only(self, ai_env, monkeypatch, caplog):
         mock_post(monkeypatch, side_effect=requests_lib.exceptions.Timeout("slow"))
