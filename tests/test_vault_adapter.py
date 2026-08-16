@@ -200,6 +200,8 @@ class TestOrderRouting:
             bot_id=BOT_ID,
             exchange="binance",
             order_id="EX-1",
+            # Binance requires the symbol on cancel; must always be forwarded.
+            symbol="SOL/USDT",
         )
         assert result["status"] == "canceled"
         assert result["id"] == "EX-1"
@@ -661,6 +663,24 @@ class TestVaultHTTPClientContract:
         assert seen["url"] == f"https://vault.test/v1/proxy/{VAULT_KEY_ID}/orders/cancel"
         assert seen["body"] == {"bot_id": BOT_ID, "exchange": "binance", "order_id": "EX-9"}
 
+    def test_cancel_order_contract_with_symbol(self):
+        # Binance's cancel endpoint requires the symbol; the vault accepts an
+        # optional "symbol" field and forwards it to the handler.
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "cancelled"})
+
+        client = make_http_client(handler)
+        client.cancel_order(VAULT_KEY_ID, "lease-1", BOT_ID, "binance", "EX-9", symbol="SOL/USDT")
+        assert seen["body"] == {
+            "bot_id": BOT_ID,
+            "exchange": "binance",
+            "order_id": "EX-9",
+            "symbol": "SOL/USDT",
+        }
+
     def test_get_balances_contract(self):
         seen = {}
 
@@ -1118,8 +1138,12 @@ class TestKrakenTradePagination:
     SAMPLE_TRADES = [
         # info is a raw Kraken trade list (>7 entries) - cursor is its tail.
         (
-            [{"info": ["p", "v", "t", "s", "o", "m", "l", "x", KRAKEN_CURSOR],
-              "timestamp": 1705443695120}],
+            [
+                {
+                    "info": ["p", "v", "t", "s", "o", "m", "l", "x", KRAKEN_CURSOR],
+                    "timestamp": 1705443695120,
+                }
+            ],
             KRAKEN_CURSOR,
         ),
         # info too short - fall back to the timestamp.

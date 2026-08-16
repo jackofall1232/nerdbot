@@ -1,16 +1,26 @@
 # Ignore file for Dockerfile.nerdbot builds ONLY (BuildKit picks
 # <Dockerfile>.dockerignore over .dockerignore for `-f Dockerfile.nerdbot`).
 # The stock .dockerignore excludes user_data/, which this image exists to
-# ship - so this file re-includes it while keeping the context minimal.
+# ship - so this file whitelists exactly the Nerdbot overlay directories.
 # The stock Dockerfile and .dockerignore are deliberately untouched.
+#
+# SECURITY: docker does NOT honor .gitignore, so a developer checkout may
+# contain untracked files with credentials (user_data/config.json, local
+# sqlite/log/data files). Only the four tracked overlay directories are
+# sent to the build context - nothing else under user_data/ can ever be
+# baked into an image layer.
 
 # Exclude everything ...
 *
 
-# ... except the Nerdbot user_data overlay.
-!user_data/
+# ... except the tracked Nerdbot overlay directories.
+!user_data/exchange/
+!user_data/scripts/
+!user_data/strategies/
+!user_data/config_templates/
 
-# Keep build-context junk out of the image.
+# CI-generated sample strategies and build-context junk must never ship.
+user_data/strategies/Awesome*
 **/__pycache__
 **/*.pyc
 **/*.sqlite

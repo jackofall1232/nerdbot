@@ -7,6 +7,7 @@
     "tradable_balance_ratio": 0.99,
     "fiat_display_currency": "USD",
     "dry_run": false,
+    "db_url": "sqlite:////freqtrade/data/tradesv3.sqlite",
     "cancel_open_orders_on_exit": false,
     "trading_mode": "spot",
     "margin_mode": "",

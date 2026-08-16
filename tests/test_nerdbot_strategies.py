@@ -10,9 +10,10 @@ Tests for the Nerdbot strategies (user_data/strategies/).
   launched bot can actually load them.
 """
 
+import json
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -34,7 +35,7 @@ from nerdbot_strategy import NerdbotStrategy  # noqa: E402
 
 
 TOKEN = "super-secret-ai-token"
-CANDLE_TIME = datetime(2026, 8, 16, 12, 3, 27, tzinfo=timezone.utc)
+CANDLE_TIME = datetime(2026, 8, 16, 12, 3, 27, tzinfo=UTC)
 
 
 def make_strategy(cls):
@@ -174,9 +175,7 @@ class TestEntryRule:
 
     def test_requires_rsi_cross_not_level(self):
         # RSI already above 30 on both candles: no cross, no entry.
-        df = self.make().populate_entry_trend(
-            entry_frame(rsi=[35.0, 36.0]), {"pair": "SOL/USD"}
-        )
+        df = self.make().populate_entry_trend(entry_frame(rsi=[35.0, 36.0]), {"pair": "SOL/USD"})
         assert "enter_long" not in df.columns or df["enter_long"].iloc[-1] != 1
 
     def test_blocked_above_bb_middleband(self):
@@ -192,9 +191,7 @@ class TestEntryRule:
         assert "enter_long" not in df.columns or df["enter_long"].iloc[-1] != 1
 
     def test_blocked_on_zero_volume(self):
-        df = self.make().populate_entry_trend(
-            entry_frame(volume=[10.0, 0.0]), {"pair": "SOL/USD"}
-        )
+        df = self.make().populate_entry_trend(entry_frame(volume=[10.0, 0.0]), {"pair": "SOL/USD"})
         assert "enter_long" not in df.columns or df["enter_long"].iloc[-1] != 1
 
 
@@ -203,15 +200,11 @@ class TestExitRule:
         return make_strategy(NerdbotStrategy)
 
     def test_fires_on_rsi_overbought_cross(self):
-        df = self.make().populate_exit_trend(
-            entry_frame(rsi=[68.0, 72.0]), {"pair": "SOL/USD"}
-        )
+        df = self.make().populate_exit_trend(entry_frame(rsi=[68.0, 72.0]), {"pair": "SOL/USD"})
         assert df["exit_long"].iloc[-1] == 1
 
     def test_fires_on_upper_band_breakout(self):
-        df = self.make().populate_exit_trend(
-            entry_frame(close=[101.0, 103.0]), {"pair": "SOL/USD"}
-        )
+        df = self.make().populate_exit_trend(entry_frame(close=[101.0, 103.0]), {"pair": "SOL/USD"})
         assert df["exit_long"].iloc[-1] == 1
 
     def test_no_exit_without_signal(self):
@@ -248,14 +241,19 @@ def make_ai_strategy():
     return make_strategy(NerdbotAIStrategy)
 
 
-def make_response(score, payload=None):
+def make_response(score, payload=None, body=None):
+    """Mock of a streamed requests.Response (raise_for_status/iter_content/close)."""
     response = MagicMock()
     response.raise_for_status.return_value = None
-    response.json.return_value = (
-        payload
-        if payload is not None
-        else {"pair": "SOL/USD", "timeframe": "5m", "score": score, "tier": "enhanced"}
-    )
+    if body is None:
+        data = (
+            payload
+            if payload is not None
+            else {"pair": "SOL/USD", "timeframe": "5m", "score": score, "tier": "enhanced"}
+        )
+        body = json.dumps(data).encode()
+    # Fresh iterator per call so a cached response mock can be re-read.
+    response.iter_content.side_effect = lambda chunk_size=4096: iter([body])
     return response
 
 
@@ -265,7 +263,10 @@ def mock_post(monkeypatch, response=None, side_effect=None):
         post.side_effect = side_effect
     else:
         post.return_value = response if response is not None else make_response(0.9)
-    monkeypatch.setattr(ai_module.requests, "post", post)
+    # The strategy posts through a requests.Session created in __init__;
+    # patching at class level covers every instance regardless of when it
+    # was constructed.
+    monkeypatch.setattr(ai_module.requests.Session, "post", post)
     return post
 
 
@@ -333,6 +334,8 @@ class TestAISuccessPath:
         assert read_timeout <= 5.0
         # Redirects must never be followed (would re-send the bearer token).
         assert kwargs["allow_redirects"] is False
+        # Streamed so the body read enforces a total wall-clock deadline.
+        assert kwargs["stream"] is True
 
     def test_is_pro_false_by_default(self, ai_env, monkeypatch):
         monkeypatch.delenv("IS_PRO_USER")
@@ -366,9 +369,7 @@ class TestAIFailurePaths:
         assert confirm(make_ai_strategy()) is True
         post.assert_not_called()
 
-    @pytest.mark.parametrize(
-        "missing", ["AI_SERVICE_URL", "AI_SERVICE_TOKEN", "REAL_EXCHANGE"]
-    )
+    @pytest.mark.parametrize("missing", ["AI_SERVICE_URL", "AI_SERVICE_TOKEN", "REAL_EXCHANGE"])
     def test_each_missing_env_var_disables_ai(self, ai_env, monkeypatch, missing):
         monkeypatch.delenv(missing)
         post = mock_post(monkeypatch)
@@ -405,8 +406,35 @@ class TestAIFailurePaths:
         assert confirm(make_ai_strategy()) is True
 
     def test_non_json_body_allows_entry(self, ai_env, monkeypatch):
+        mock_post(monkeypatch, make_response(0.9, body=b"<html>not json</html>"))
+        assert confirm(make_ai_strategy()) is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            # A response labeled for another pair or timeframe must never
+            # gate this pair's entry (stale/misrouted response).
+            {"pair": "BTC/USD", "timeframe": "5m", "score": 0.1, "tier": "enhanced"},
+            {"pair": "SOL/USD", "timeframe": "1h", "score": 0.1, "tier": "enhanced"},
+        ],
+    )
+    def test_identity_mismatch_allows_entry(self, ai_env, monkeypatch, payload):
+        mock_post(monkeypatch, make_response(None, payload=payload))
+        assert confirm(make_ai_strategy(), pair="SOL/USD") is True
+
+    def test_oversized_response_allows_entry(self, ai_env, monkeypatch):
+        big = b'{"pad": "' + b"x" * (ai_module.AI_MAX_RESPONSE_BYTES + 1) + b'"}'
+        mock_post(monkeypatch, make_response(None, body=big))
+        assert confirm(make_ai_strategy()) is True
+
+    def test_slow_drip_response_hits_total_deadline(self, ai_env, monkeypatch):
+        # Each inter-chunk gap can stay under the read timeout while total
+        # wall time grows without bound - the monotonic deadline must cut
+        # the read off and degrade to the base decision.
+        clock = iter([0.0, ai_module.AI_TOTAL_DEADLINE_SECONDS + 1.0])
+        monkeypatch.setattr(ai_module.time, "monotonic", lambda: next(clock))
         response = make_response(0.9)
-        response.json.side_effect = ValueError("not json")
+        response.iter_content.side_effect = lambda chunk_size=4096: iter([b"{", b"}"])
         mock_post(monkeypatch, response)
         assert confirm(make_ai_strategy()) is True
 

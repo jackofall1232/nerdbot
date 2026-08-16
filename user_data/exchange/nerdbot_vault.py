@@ -77,6 +77,7 @@ SECURITY INVARIANTS
 import logging
 import os
 import time
+from typing import cast
 
 
 try:  # package-style import (tests / repo usage)
@@ -84,9 +85,9 @@ try:  # package-style import (tests / repo usage)
     from user_data.exchange.paper_trading import PaperTradingSimulator
     from user_data.exchange.vault_http_client import VaultHTTPClient
 except ImportError:  # flat import (PYTHONPATH=user_data/exchange at runtime)
-    from market_data_client import MarketDataClient  # type: ignore[no-redef]
-    from paper_trading import PaperTradingSimulator  # type: ignore[no-redef]
-    from vault_http_client import VaultHTTPClient  # type: ignore[no-redef]
+    from market_data_client import MarketDataClient
+    from paper_trading import PaperTradingSimulator
+    from vault_http_client import VaultHTTPClient
 
 import ccxt
 
@@ -132,7 +133,7 @@ def _order_entry_to_ccxt(entry: dict, requested_symbol: str | None = None) -> di
     order_id = entry.get("order_id")
     if not order_id:
         raise ccxt.ExchangeError("vault order entry missing order_id")
-    status = entry.get("status")
+    status = str(entry.get("status") or "")
     return {
         "id": str(order_id),
         "clientOrderId": None,
@@ -327,7 +328,12 @@ class NerdbotVaultAdapter:
             "info": response,
         }
 
-    def cancel_order(self, id: str, symbol: str | None = None, params: dict | None = None) -> dict:  # noqa: A002
+    def cancel_order(
+        self,
+        id: str,  # noqa: A002
+        symbol: str | None = None,
+        params: dict | None = None,
+    ) -> dict:
         """Cancel an order via the vault proxy (or paper simulator)."""
         if self.is_paper_trading:
             return self.paper_simulator.cancel_order(id)
@@ -339,6 +345,8 @@ class NerdbotVaultAdapter:
             bot_id=self.bot_id,
             exchange=self.real_exchange,
             order_id=id,
+            # Binance requires the symbol on cancel; the vault forwards it.
+            symbol=symbol,
         )
         status = response.get("status")
         if status == "not_found":
@@ -418,7 +426,12 @@ class NerdbotVaultAdapter:
     # Order state (read-only) -> vault proxy (or paper simulator)
     # ------------------------------------------------------------------
 
-    def fetch_order(self, id: str, symbol: str | None = None, params: dict | None = None) -> dict:  # noqa: A002
+    def fetch_order(
+        self,
+        id: str,  # noqa: A002
+        symbol: str | None = None,
+        params: dict | None = None,
+    ) -> dict:
         """
         Fetch the current state of an order.
 
@@ -479,6 +492,7 @@ try:
     )
     from freqtrade.exchange import Exchange as _FreqtradeExchange
     from freqtrade.exchange.common import API_FETCH_ORDER_RETRY_COUNT, retrier
+    from freqtrade.exchange.exchange_types import FtHas
     from freqtrade.misc import deep_merge_dicts
 
     FREQTRADE_AVAILABLE = True
@@ -578,12 +592,12 @@ if FREQTRADE_AVAILABLE:
         runs. Vault configuration is therefore required in paper mode too.
         """
 
-        _ft_has: dict = {
+        _ft_has: "FtHas" = {
             "ws_enabled": False,  # no ccxt.pro class is registered for the shim
         }
 
         @classmethod
-        def combine_ft_has(cls, include_futures: bool) -> dict:
+        def combine_ft_has(cls, include_futures: bool) -> "FtHas":
             """
             Parent combination (class ``_ft_has`` over defaults), then merge
             the REAL_EXCHANGE data-correctness quirks on top. Config-level
@@ -596,7 +610,7 @@ if FREQTRADE_AVAILABLE:
             real_exchange = os.environ.get("REAL_EXCHANGE", "").strip().lower()
             quirks = REAL_EXCHANGE_DATA_FT_HAS.get(real_exchange)
             if quirks:
-                ft_has = deep_merge_dicts(deepcopy(quirks), ft_has)
+                ft_has = cast("FtHas", deep_merge_dicts(deepcopy(quirks), dict(ft_has)))
             return ft_has
 
         @staticmethod
@@ -844,7 +858,7 @@ if FREQTRADE_AVAILABLE:
                 raise OperationalException(e) from e
 
 else:  # pragma: no cover - exercised only without freqtrade installed
-    Nerdbot_Vault = None  # type: ignore[assignment]
+    Nerdbot_Vault = None  # type: ignore[assignment,misc]
 
 
 def register() -> bool:
@@ -863,7 +877,7 @@ def register() -> bool:
         return False
     import freqtrade.exchange as ft_exchange_pkg
 
-    ft_exchange_pkg.Nerdbot_Vault = Nerdbot_Vault
+    ft_exchange_pkg.Nerdbot_Vault = Nerdbot_Vault  # type: ignore[attr-defined]
     logger.info("Registered Nerdbot_Vault exchange with Freqtrade resolver")
     return True
 

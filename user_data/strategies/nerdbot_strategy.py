@@ -25,12 +25,11 @@ strategy and must never change these base signals - it may only veto entries
 using the nerdbot-ai score.
 """
 
+import talib.abstract as ta
 from pandas import DataFrame
+from technical import qtpylib
 
 from freqtrade.strategy import IStrategy
-
-import talib.abstract as ta
-from technical import qtpylib
 
 
 class NerdbotStrategy(IStrategy):

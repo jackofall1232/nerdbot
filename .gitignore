@@ -8,6 +8,10 @@ user_data/*
 !user_data/exchange/
 !user_data/scripts/
 !user_data/strategies/
+# CI's `freqtrade new-strategy` test generates sample strategies here
+# before linting runs; keep them out of git AND out of ruff (which
+# respects gitignore).
+user_data/strategies/Awesome*
 !user_data/config_templates/
 !user_data/config_templates/config_*.json
 !user_data/notebooks

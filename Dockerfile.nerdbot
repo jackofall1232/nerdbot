@@ -23,7 +23,15 @@
 # Exchange credentials NEVER reach this container - start_bot.sh refuses to
 # start if any EXCHANGE_API_* / FREQTRADE__EXCHANGE__* variable is set.
 
-FROM freqtradeorg/freqtrade:stable
+# Overridable base so deployments can pin a specific release or digest for
+# reproducible builds, e.g.:
+#   docker build -f Dockerfile.nerdbot \
+#     --build-arg BASE_IMAGE=freqtradeorg/freqtrade:stable@sha256:<digest> \
+#     -t nerdbot-engine:latest .
+# The floating :stable default is kept because this repo tracks upstream
+# stable; pin at build time for production.
+ARG BASE_IMAGE=freqtradeorg/freqtrade:stable
+FROM ${BASE_IMAGE}
 
 # The upstream image runs as the non-root user "ftuser" (uid 1000) with
 # WORKDIR /freqtrade owned by that user. Copy the Nerdbot overlay with the

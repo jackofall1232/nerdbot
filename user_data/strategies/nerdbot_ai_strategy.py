@@ -29,17 +29,19 @@ The score is cached per (pair, latest-candle-timestamp) - failures
 included - so each pair triggers at most one HTTP call per candle.
 """
 
+import json
 import logging
 import os
+import time
 from datetime import datetime
 
 import requests
 
-from freqtrade.strategy import timeframe_to_prev_date
-
 # Freqtrade puts this directory on sys.path while loading strategies, so the
 # base strategy is importable module-style (documented same-directory import).
 from nerdbot_strategy import NerdbotStrategy
+
+from freqtrade.strategy import timeframe_to_prev_date
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,14 @@ AI_SCORE_ENTRY_THRESHOLD = 0.55
 #: requests bounds connect and read SEPARATELY (read = max gap between
 #: bytes), so a (connect, read) tuple is used: 3.05s to connect, 5s read.
 AI_REQUEST_TIMEOUT: tuple[float, float] = (3.05, 5.0)
+
+#: The read timeout above only caps the gap BETWEEN bytes - a server that
+#: drips one byte every few seconds would never trip it. The body is
+#: therefore streamed against this total wall-clock deadline (and a size
+#: cap far above any real /features payload) so confirm_trade_entry can
+#: never stall the trading loop.
+AI_TOTAL_DEADLINE_SECONDS = 6.0
+AI_MAX_RESPONSE_BYTES = 65536
 
 
 class NerdbotAIStrategy(NerdbotStrategy):
@@ -65,6 +75,9 @@ class NerdbotAIStrategy(NerdbotStrategy):
         # once per candle.
         self._ai_score_cache: dict[str, tuple[datetime, float | None]] = {}
         self._ai_disabled_logged = False
+        # One session per bot lifetime: reuses the TCP/TLS connection to
+        # nerdbot-ai instead of a fresh handshake every candle.
+        self._ai_session = requests.Session()
 
     # ------------------------------------------------------------------
     # nerdbot-ai client (private helpers)
@@ -107,7 +120,7 @@ class NerdbotAIStrategy(NerdbotStrategy):
             return None
         url, token, exchange, is_pro = settings
         try:
-            response = requests.post(
+            response = self._ai_session.post(
                 f"{url}/features",
                 json={
                     "pair": pair,
@@ -120,13 +133,32 @@ class NerdbotAIStrategy(NerdbotStrategy):
                 # The service never redirects; following one could resend
                 # the bearer token to an unexpected host.
                 allow_redirects=False,
+                # Streamed so the body read below can enforce a TOTAL
+                # wall-clock deadline (the read timeout is only per-gap).
+                stream=True,
             )
-            response.raise_for_status()
-            score = float(response.json()["score"])
+            try:
+                response.raise_for_status()
+                deadline = time.monotonic() + AI_TOTAL_DEADLINE_SECONDS
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=4096):
+                    body.extend(chunk)
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("AI response exceeded total deadline")
+                    if len(body) > AI_MAX_RESPONSE_BYTES:
+                        raise ValueError("AI response too large")
+            finally:
+                response.close()
+            payload = json.loads(bytes(body))
+            # A stale or misrouted response for another market must never
+            # gate this pair's entry - treat it as malformed.
+            if payload.get("pair") != pair or payload.get("timeframe") != self.timeframe:
+                raise ValueError("AI response identity mismatch")
+            score = float(payload["score"])
             if not 0.0 <= score <= 1.0:
                 raise ValueError("score out of range")
             return score
-        except Exception as exc:  # noqa: BLE001 - the AI layer must never raise
+        except Exception as exc:
             logger.debug(
                 "nerdbot-ai call failed for %s (%s) - using standard NerdbotStrategy signals",
                 pair,

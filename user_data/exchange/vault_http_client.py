@@ -236,14 +236,23 @@ class VaultHTTPClient:
         return self._post(f"/v1/proxy/{vault_key_id}/orders", body, lease_id=lease_id)
 
     def cancel_order(
-        self, vault_key_id: str, lease_id: str, bot_id: str, exchange: str, order_id: str
+        self,
+        vault_key_id: str,
+        lease_id: str,
+        bot_id: str,
+        exchange: str,
+        order_id: str,
+        symbol: str | None = None,
     ) -> dict:
         """
         Cancel an order. POST /v1/proxy/{vault_key_id}/orders/cancel
 
+        :param symbol: Exchange symbol; required by some exchanges (Binance).
         :return: {"status": "cancelled"|"not_found"|"rejected"}
         """
-        body = {"bot_id": str(bot_id), "exchange": exchange, "order_id": str(order_id)}
+        body: dict = {"bot_id": str(bot_id), "exchange": exchange, "order_id": str(order_id)}
+        if symbol is not None:
+            body["symbol"] = symbol
         return self._post(f"/v1/proxy/{vault_key_id}/orders/cancel", body, lease_id=lease_id)
 
     def query_order(
