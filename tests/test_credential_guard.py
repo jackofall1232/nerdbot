@@ -9,8 +9,19 @@ success case puts a stub `freqtrade` executable on PATH.
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
+
+# start_bot.sh is a container entrypoint and only ever runs on Linux; on
+# Windows runners `bash` resolves to the WSL stub (no distribution
+# installed), so the subprocess launches cannot work there at all.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="start_bot.sh needs a POSIX shell; Windows resolves `bash` to the WSL stub",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 START_BOT = REPO_ROOT / "user_data" / "scripts" / "start_bot.sh"
