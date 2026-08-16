@@ -8,6 +8,7 @@ dependency.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -131,23 +132,44 @@ class TestOrderRouting:
         adapter = make_adapter(vault_client=client)
         order = adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
 
-        client.place_order.assert_called_once_with(
-            vault_key_id=VAULT_KEY_ID,
-            lease_id="lease-2",  # fresh lease, not the init lease
-            bot_id=BOT_ID,
-            exchange="binance",
-            symbol="SOL/USDT",
-            side="buy",
-            type="limit",
-            amount=2.0,
-            price=100.0,
-            client_order_id=None,
-        )
+        kwargs = client.place_order.call_args.kwargs
+        generated_id = kwargs.pop("client_order_id")
+        assert kwargs == {
+            "vault_key_id": VAULT_KEY_ID,
+            "lease_id": "lease-2",  # fresh lease, not the init lease
+            "bot_id": BOT_ID,
+            "exchange": "binance",
+            "symbol": "SOL/USDT",
+            "side": "buy",
+            "type": "limit",
+            "amount": 2.0,
+            "price": 100.0,
+        }
+        # A client order id is ALWAYS sent (exchange-side dedupe makes the
+        # vault->exchange leg retry-safe); minted ids satisfy the strictest
+        # exchange format: alphanumeric, 32 chars.
+        assert re.fullmatch(r"nb[0-9a-f]{30}", generated_id)
         assert order["id"] == "EX-1"
         assert order["status"] == "open"
         assert order["symbol"] == "SOL/USDT"
         assert order["amount"] == 2.0
         assert order["remaining"] == 2.0
+
+    def test_caller_supplied_client_order_id_passes_through(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.create_order(
+            "SOL/USDT", "limit", "buy", 2.0, 100.0, {"clientOrderId": "mycustomid1"}
+        )
+        assert client.place_order.call_args.kwargs["client_order_id"] == "mycustomid1"
+
+    def test_minted_client_order_ids_are_unique_per_call(self, vault_env):
+        client = make_vault_client_mock()
+        adapter = make_adapter(vault_client=client)
+        adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
+        adapter.create_order("SOL/USDT", "limit", "buy", 2.0, 100.0)
+        first, second = (c.kwargs["client_order_id"] for c in client.place_order.call_args_list)
+        assert first != second
 
     def test_filled_vault_status_maps_to_closed(self, vault_env):
         client = make_vault_client_mock()
@@ -200,6 +222,8 @@ class TestOrderRouting:
             bot_id=BOT_ID,
             exchange="binance",
             order_id="EX-1",
+            # Binance requires the symbol on cancel; must always be forwarded.
+            symbol="SOL/USDT",
         )
         assert result["status"] == "canceled"
         assert result["id"] == "EX-1"
@@ -661,6 +685,24 @@ class TestVaultHTTPClientContract:
         assert seen["url"] == f"https://vault.test/v1/proxy/{VAULT_KEY_ID}/orders/cancel"
         assert seen["body"] == {"bot_id": BOT_ID, "exchange": "binance", "order_id": "EX-9"}
 
+    def test_cancel_order_contract_with_symbol(self):
+        # Binance's cancel endpoint requires the symbol; the vault accepts an
+        # optional "symbol" field and forwards it to the handler.
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"status": "cancelled"})
+
+        client = make_http_client(handler)
+        client.cancel_order(VAULT_KEY_ID, "lease-1", BOT_ID, "binance", "EX-9", symbol="SOL/USDT")
+        assert seen["body"] == {
+            "bot_id": BOT_ID,
+            "exchange": "binance",
+            "order_id": "EX-9",
+            "symbol": "SOL/USDT",
+        }
+
     def test_get_balances_contract(self):
         seen = {}
 
@@ -867,10 +909,17 @@ class TestCloseChain:
 
     @pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
     def test_freqtrade_close_chains_adapter_then_super(self, vault_env):
+        import gc
         from unittest.mock import patch
 
         from freqtrade.exchange import Exchange
         from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        # Exchange.__del__ calls self.close(); bare instances from earlier
+        # tests can finalize INSIDE the patch window below (observed on
+        # Python 3.14's GC timing), recording a phantom extra close call.
+        # Flush pending finalizers first so only this test's call counts.
+        gc.collect()
 
         exchange = object.__new__(Nerdbot_Vault)
         # Attributes Exchange.close()/__del__ dereference at GC time.
@@ -1005,6 +1054,201 @@ class TestFreqtradeOrderStateRouting:
         exchange._vault_adapter.fetch_open_orders.side_effect = ccxt.BaseError("boom")
         with pytest.raises(OperationalException):
             exchange.fetch_open_orders("SOL/USD")
+
+
+# =============================================================================
+# REAL_EXCHANGE-parameterized _ft_has (data-correctness quirks)
+# =============================================================================
+
+
+@pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+class TestRealExchangeFtHas:
+    """
+    Nerdbot_Vault extends the GENERIC Exchange class, so per-exchange
+    subclass quirks (freqtrade/exchange/kraken.py) must be re-applied for
+    the data path - and ONLY the data path, since orders route through
+    dry-run or the vault, never native exchange order endpoints.
+    """
+
+    #: The Kraken._ft_has entries the adapter mirrors (data path only).
+    KRAKEN_DATA_KEYS = (
+        "ohlcv_has_history",
+        "trades_pagination",
+        "trades_pagination_arg",
+        "trades_pagination_overlap",
+        "trades_has_history",
+    )
+
+    @staticmethod
+    def build_ft_has(monkeypatch, real_exchange: str, exchange_conf: dict | None = None) -> dict:
+        from freqtrade.enums import TradingMode
+        from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        monkeypatch.setenv("REAL_EXCHANGE", real_exchange)
+        exchange = object.__new__(Nerdbot_Vault)
+        exchange.trading_mode = TradingMode.SPOT
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        exchange._exchange_ws = None
+        exchange._ws_async = None
+        exchange.loop = None
+        exchange.build_ft_has(exchange_conf or {})
+        return exchange._ft_has
+
+    def test_kraken_inherits_data_quirks(self, vault_env, monkeypatch):
+        ft_has = self.build_ft_has(monkeypatch, "kraken")
+        assert ft_has["ohlcv_has_history"] is False
+        assert ft_has["trades_pagination"] == "id"
+        assert ft_has["trades_pagination_arg"] == "since"
+        assert ft_has["trades_pagination_overlap"] is False
+        assert ft_has["trades_has_history"] is True
+
+    def test_kraken_quirks_match_kraken_class_source(self, vault_env, monkeypatch):
+        # Guard against upstream drift: the mirrored values must stay
+        # identical to the real Kraken class for every mirrored key.
+        from freqtrade.exchange.kraken import Kraken
+
+        ft_has = self.build_ft_has(monkeypatch, "kraken")
+        for key in self.KRAKEN_DATA_KEYS:
+            assert ft_has[key] == Kraken._ft_has[key], key
+
+    def test_kraken_does_not_inherit_order_execution_quirks(self, vault_env, monkeypatch):
+        # Orders route through dry-run/vault - Kraken's native order quirks
+        # (stoploss_on_exchange, IOC/PO time-in-force) must NOT come over.
+        ft_has = self.build_ft_has(monkeypatch, "kraken")
+        assert ft_has["stoploss_on_exchange"] is False
+        assert ft_has["order_time_in_force"] == ["GTC"]
+        assert ft_has["stoploss_order_types"] == {}
+
+    def test_coinbase_keeps_generic_data_defaults(self, vault_env, monkeypatch):
+        ft_has = self.build_ft_has(monkeypatch, "coinbase")
+        assert ft_has["ohlcv_has_history"] is True
+        assert ft_has["trades_pagination"] == "time"
+        assert ft_has["stoploss_on_exchange"] is False
+
+    def test_binance_keeps_generic_data_defaults(self, vault_env, monkeypatch):
+        ft_has = self.build_ft_has(monkeypatch, "binance")
+        assert ft_has["ohlcv_has_history"] is True
+
+    @pytest.mark.parametrize("real_exchange", ["binance", "kraken", "coinbase"])
+    def test_ws_disabled_for_every_real_exchange(self, vault_env, monkeypatch, real_exchange):
+        ft_has = self.build_ft_has(monkeypatch, real_exchange)
+        assert ft_has["ws_enabled"] is False
+
+    def test_config_ft_has_params_still_win_over_quirks(self, vault_env, monkeypatch):
+        # Explicit config-level overrides must keep the highest precedence.
+        ft_has = self.build_ft_has(
+            monkeypatch, "kraken", {"_ft_has_params": {"ohlcv_has_history": True}}
+        )
+        assert ft_has["ohlcv_has_history"] is True
+
+    def test_unknown_real_exchange_leaves_defaults_untouched(self, vault_env, monkeypatch):
+        ft_has = self.build_ft_has(monkeypatch, "")
+        assert ft_has["ohlcv_has_history"] is True
+        assert ft_has["ws_enabled"] is False
+
+
+# =============================================================================
+# Kraken trade-pagination method quirks (mirrored from freqtrade Kraken class)
+# =============================================================================
+
+
+@pytest.mark.skipif(not FREQTRADE_AVAILABLE, reason="freqtrade not installed")
+class TestKrakenTradePagination:
+    """
+    The trades_pagination _ft_has flags need Kraken's two method overrides
+    (_get_trade_pagination_next_value / _valid_trade_pagination_id) for
+    id-based pagination to work. Nerdbot_Vault mirrors them for
+    REAL_EXCHANGE=kraken only; the drift-guard tests compare behavior
+    against the real Kraken class on the same sample inputs.
+    """
+
+    KRAKEN_CURSOR = "1705443695120072285"  # 19-char nanosecond timestamp id
+
+    SAMPLE_TRADES = [
+        # info is a raw Kraken trade list (>7 entries) - cursor is its tail.
+        (
+            [
+                {
+                    "info": ["p", "v", "t", "s", "o", "m", "l", "x", KRAKEN_CURSOR],
+                    "timestamp": 1705443695120,
+                }
+            ],
+            KRAKEN_CURSOR,
+        ),
+        # info too short - fall back to the timestamp.
+        ([{"info": ["p", "v"], "timestamp": 1705443695120}], 1705443695120),
+        # info not a list (dict) - fall back to the timestamp.
+        ([{"info": {"last": "x"}, "timestamp": 1705443695120}], 1705443695120),
+        # info missing entirely - fall back to the timestamp.
+        ([{"timestamp": 1705443695120}], 1705443695120),
+        # no trades at all.
+        ([], None),
+    ]
+
+    @staticmethod
+    def make_vault_exchange(monkeypatch, real_exchange: str):
+        from user_data.exchange.nerdbot_vault import Nerdbot_Vault
+
+        monkeypatch.setenv("REAL_EXCHANGE", real_exchange)
+        exchange = object.__new__(Nerdbot_Vault)
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        exchange._exchange_ws = None
+        exchange._ws_async = None
+        exchange.loop = None
+        return exchange
+
+    @staticmethod
+    def make_kraken():
+        from freqtrade.exchange.kraken import Kraken
+
+        kraken = object.__new__(Kraken)
+        # Attributes Exchange.close()/__del__ dereference at GC time.
+        kraken._exchange_ws = None
+        kraken._ws_async = None
+        kraken.loop = None
+        return kraken
+
+    @pytest.mark.parametrize(("trades", "expected"), SAMPLE_TRADES)
+    def test_kraken_pagination_next_value(self, vault_env, monkeypatch, trades, expected):
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange._get_trade_pagination_next_value(trades) == expected
+
+    @pytest.mark.parametrize(("trades", "expected"), SAMPLE_TRADES)
+    def test_kraken_pagination_next_value_matches_kraken_class(
+        self, vault_env, monkeypatch, trades, expected
+    ):
+        # Drift guard: identical output to the real Kraken class.
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange._get_trade_pagination_next_value(trades) == (
+            self.make_kraken()._get_trade_pagination_next_value(trades)
+        )
+
+    @pytest.mark.parametrize(
+        ("from_id", "expected"),
+        [
+            (KRAKEN_CURSOR, True),  # 19 chars - valid
+            ("17054436951200722851", True),  # longer is fine too
+            ("170544369512007228", False),  # 18 chars - invalid
+            ("", False),
+        ],
+    )
+    def test_kraken_valid_pagination_id(self, vault_env, monkeypatch, from_id, expected):
+        exchange = self.make_vault_exchange(monkeypatch, "kraken")
+        assert exchange._valid_trade_pagination_id("SOL/USD", from_id) is expected
+        # Drift guard: identical to the real Kraken class.
+        assert exchange._valid_trade_pagination_id("SOL/USD", from_id) is (
+            self.make_kraken()._valid_trade_pagination_id("SOL/USD", from_id)
+        )
+
+    @pytest.mark.parametrize("real_exchange", ["binance", "coinbase"])
+    def test_other_exchanges_keep_generic_behavior(self, vault_env, monkeypatch, real_exchange):
+        exchange = self.make_vault_exchange(monkeypatch, real_exchange)
+        # Generic Exchange consults _ft_has["trades_pagination"] ("time" for
+        # these exchanges) and returns the timestamp - and any id passes.
+        exchange._ft_has = {"trades_pagination": "time"}
+        trades = [{"id": "abc", "timestamp": 1705443695120, "info": ["x"] * 9}]
+        assert exchange._get_trade_pagination_next_value(trades) == 1705443695120
+        assert exchange._valid_trade_pagination_id("SOL/USD", "short-id") is True
 
 
 # =============================================================================

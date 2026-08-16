@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+#
+# Nerdbot engine image: the stock freqtrade image plus the Nerdbot user_data
+# overlay (nerdbot_vault exchange adapter, Nerdbot strategies, entrypoint,
+# config templates).
+#
+# Build (from the repo root; requires BuildKit, the default in Docker 23+):
+#   docker build -f Dockerfile.nerdbot -t nerdbot-engine:latest .
+#
+# NOTE: the stock .dockerignore excludes user_data/. This build uses the
+# sibling Dockerfile.nerdbot.dockerignore (BuildKit's per-Dockerfile ignore
+# file), which re-includes user_data/ WITHOUT modifying the stock
+# .dockerignore. See docs/nerdbot-engine-image.md for details. This image
+# could not be built in the development sandbox (registry egress blocked);
+# the build must be run in an environment with Docker Hub access.
+#
+# The backend references this image via its FREQTRADE_IMAGE setting
+# (default: nerdbot-engine:latest). Runtime configuration:
+#   - /freqtrade/config.json         read-only bind mount by the backend (LOCKED path)
+#   - VAULT_* / BACKEND_* / BOT_ID / REAL_EXCHANGE / IS_PAPER_TRADING   required env
+#   - AI_SERVICE_URL / AI_SERVICE_TOKEN / IS_PRO_USER                   optional env
+#   - STRATEGY                       optional; defaults to NerdbotStrategy
+# Exchange credentials NEVER reach this container - start_bot.sh refuses to
+# start if any EXCHANGE_API_* / FREQTRADE__EXCHANGE__* variable is set.
+
+# Overridable base so deployments can pin a specific release or digest for
+# reproducible builds, e.g.:
+#   docker build -f Dockerfile.nerdbot \
+#     --build-arg BASE_IMAGE=freqtradeorg/freqtrade:stable@sha256:<digest> \
+#     -t nerdbot-engine:latest .
+# The floating :stable default is kept because this repo tracks upstream
+# stable; pin at build time for production.
+ARG BASE_IMAGE=freqtradeorg/freqtrade:stable
+FROM ${BASE_IMAGE}
+
+# The upstream image runs as the non-root user "ftuser" (uid 1000) with
+# WORKDIR /freqtrade owned by that user. Copy the Nerdbot overlay with the
+# same ownership so the bot can write its runtime files (logs, dry-run db)
+# under user_data without being root.
+COPY --chown=ftuser:ftuser user_data/ /freqtrade/user_data/
+
+# Ensure the entrypoint is executable regardless of checkout permissions,
+# and pre-create the COMPLETE runtime tree freqtrade mkdirs at startup: the
+# backend runs bot containers with a READ-ONLY root filesystem, so any
+# directory missing from the image makes `freqtrade trade` die with OSError
+# at boot. The list mirrors create_userdata_dir's sub_dirs
+# (freqtrade/configuration/directory_operations.py) plus create_datadir's
+# per-exchange dir (exchange name is always "nerdbot_vault" here) - the
+# whitelist dockerignore ships only the four overlay dirs, so everything
+# else must be created explicitly.
+# /freqtrade/data is created owned by ftuser because the backend mounts a
+# fresh named volume there for the sqlite db - Docker initializes an empty
+# volume's ownership from the image path, so baking in ftuser ownership is
+# what makes the db writable by the non-root bot.
+USER root
+RUN chmod 0755 /freqtrade/user_data/scripts/start_bot.sh \
+  && mkdir -p \
+    /freqtrade/user_data/backtest_results \
+    /freqtrade/user_data/data/nerdbot_vault \
+    /freqtrade/user_data/hyperopts \
+    /freqtrade/user_data/hyperopt_results \
+    /freqtrade/user_data/logs \
+    /freqtrade/user_data/notebooks \
+    /freqtrade/user_data/plot \
+    /freqtrade/user_data/freqaimodels \
+    /freqtrade/data \
+  && chown -R ftuser:ftuser /freqtrade/user_data /freqtrade/data
+
+# Preserve the upstream convention: never run as root. The container MUST
+# run as uid 1000 (ftuser): freqtrade is pip-installed with --user into
+# /home/ftuser/.local, so any other uid loses the interpreter environment,
+# and the baked-in ftuser ownership above is what keeps the read-only-rootfs
+# setup writable where it needs to be.
+USER ftuser
+
+ENTRYPOINT ["/freqtrade/user_data/scripts/start_bot.sh"]

@@ -9,8 +9,19 @@ success case puts a stub `freqtrade` executable on PATH.
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
+
+# start_bot.sh is a container entrypoint and only ever runs on Linux; on
+# Windows runners `bash` resolves to the WSL stub (no distribution
+# installed), so the subprocess launches cannot work there at all.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="start_bot.sh needs a POSIX shell; Windows resolves `bash` to the WSL stub",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 START_BOT = REPO_ROOT / "user_data" / "scripts" / "start_bot.sh"
@@ -151,8 +162,9 @@ class TestLaunch:
 
         assert result.returncode == 0, result.stderr
         assert "FREQTRADE_STUB args: trade" in result.stdout
-        assert "--config /freqtrade/config/config.json" in result.stdout
-        assert "--strategy SampleStrategy" in result.stdout
+        # Config mount path is LOCKED at /freqtrade/config.json (contract C).
+        assert "--config /freqtrade/config.json" in result.stdout
+        assert "--strategy NerdbotStrategy" in result.stdout
 
     def test_strategy_override(self, tmp_path):
         env = dict(REQUIRED_ENV)
@@ -168,6 +180,22 @@ class TestLaunch:
         env["PATH"] = f"{stub_dir}:/usr/bin:/bin"
         result = run_script(env)
         assert "user_data/exchange" in result.stdout  # PYTHONPATH echoed by stub
+
+    def test_ai_service_env_vars_pass_the_guard(self, tmp_path):
+        """AI_SERVICE_URL/AI_SERVICE_TOKEN/IS_PRO_USER are allowed through
+        (they are service config, not exchange credentials) - and the AI
+        token is never echoed."""
+        env = dict(REQUIRED_ENV)
+        env["AI_SERVICE_URL"] = "http://nerdbot-ai:8000"
+        env["AI_SERVICE_TOKEN"] = "ai-secret-token"
+        env["IS_PRO_USER"] = "true"
+        stub_dir = make_freqtrade_stub(tmp_path)
+        env["PATH"] = f"{stub_dir}:/usr/bin:/bin"
+        result = run_script(env)
+        assert result.returncode == 0, result.stderr
+        assert "FATAL" not in result.stderr
+        assert "ai-secret-token" not in result.stdout
+        assert "ai-secret-token" not in result.stderr
 
     def test_backend_token_not_echoed(self, tmp_path):
         env = dict(REQUIRED_ENV)

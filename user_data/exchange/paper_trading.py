@@ -147,6 +147,8 @@ class PaperTradingSimulator:
             fills_now = True
             fill_price = market_price
         else:
+            if price is None:
+                raise ccxt.InvalidOrder("limit order requires a price")
             price = float(price)
             # Marketable limit orders fill at the limit price (conservative).
             fills_now = (side == "buy" and price >= market_price) or (
@@ -158,7 +160,9 @@ class PaperTradingSimulator:
         quote_acct = self._ensure_currency(quote)
 
         if side == "buy":
-            ref_price = fill_price if order_type == "market" or fills_now else float(price)
+            # fill_price already equals the (float) limit price for resting
+            # limit orders, so it is the reference price in every case.
+            ref_price = fill_price
             cost = amount * ref_price
             fee_cost = cost * self._fee_rate
             required = cost + fee_cost

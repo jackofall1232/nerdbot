@@ -333,6 +333,10 @@ known-first-party = ["freqtrade_client"]
 ignore = ["E121","E123","E126","E24", "E203","E704","W503","W504"]
 max-line-length = 100
 max-complexity = 12
+# flake8 counts the vault adapter's whole `if FREQTRADE_AVAILABLE:`
+# integration guard as one statement; waive complexity for that file only
+# (pre-commit passes filenames explicitly, so `exclude` does not cover it).
+per-file-ignores = ["user_data/exchange/nerdbot_vault.py:C901"]
 exclude = [
     ".git",
     "__pycache__",
